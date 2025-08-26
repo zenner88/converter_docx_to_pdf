@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  api:
+    container_name: pdef-generator-api-win
+    build:
+      context: .
+      dockerfile: Dockerfile.windows
+    image: pdef-generator-api:windows
+    ports:
+      - "8000:8000"
+    # Windows containers don't support bind mounts the same way; comment out volumes by default.
+    # volumes:
+    #   - ./:C:/app
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    # IMPORTANT: Microsoft Word is not present in the container. docx2pdf won't work here.
+    # Use host-based conversion or LibreOffice alternative if you need conversion inside container.

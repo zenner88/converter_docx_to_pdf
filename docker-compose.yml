@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: pdef-generator-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    # IMPORTANT: docx2pdf requires Microsoft Word and will not work inside this Linux container.
+    # The /convert endpoint will fail when running in Docker.
