@@ -70,6 +70,14 @@ async def convert_docx_to_pdf(
 
     if not os.path.exists(path_pdf):
         raise HTTPException(status_code=500, detail="File PDF tidak ditemukan setelah konversi")
+    
+    # Check file size
+    file_size = os.path.getsize(path_pdf)
+    max_size = 5 * 1024 * 1024  # 5MB limit
+    if file_size > max_size:
+        print(f"WARNING: PDF file size {file_size} bytes exceeds recommended limit")
+    
+    print(f"INFO: PDF created successfully - Size: {file_size} bytes, Path: {path_pdf}")
 
     # Kirim ke target_url/check/responseBalikConvert
     post_url = f"{target_url.rstrip('/')}" + "/check/responseBalikConvert"
@@ -80,6 +88,7 @@ async def convert_docx_to_pdf(
                 file_size = os.path.getsize(path_pdf)
                 print(f"DEBUG: Uploading PDF size: {file_size} bytes to {post_url}")
                 
+                # Target server expects 'docupload' field name
                 files = {"docupload": (os.path.basename(path_pdf), fpdf, "application/pdf")}
                 headers = {
                     "User-Agent": "FastAPI-DOCX-Converter/1.0",
