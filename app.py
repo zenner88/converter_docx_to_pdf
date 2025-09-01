@@ -76,14 +76,30 @@ async def convert_docx_to_pdf(
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
             with open(path_pdf, "rb") as fpdf:
+                # Get file size for debugging
+                file_size = os.path.getsize(path_pdf)
+                print(f"DEBUG: Uploading PDF size: {file_size} bytes to {post_url}")
+                
                 files = {"docupload": (os.path.basename(path_pdf), fpdf, "application/pdf")}
-                resp = await client.post(post_url, files=files)
+                headers = {
+                    "User-Agent": "FastAPI-DOCX-Converter/1.0",
+                }
+                resp = await client.post(post_url, files=files, headers=headers)
+                
+                print(f"DEBUG: Target response status: {resp.status_code}")
+                print(f"DEBUG: Target response headers: {dict(resp.headers)}")
+                
         resp_text = resp.text
         try:
             resp_json = resp.json()
         except Exception:
             resp_json = None
+            
+        # Log response untuk debugging
+        print(f"DEBUG: Target response text: {resp_text[:500]}")
+        
     except httpx.HTTPError as e:
+        print(f"DEBUG: HTTP Error: {e}")
         raise HTTPException(status_code=502, detail=f"Gagal upload ke target: {e}")
 
     return JSONResponse(
