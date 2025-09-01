@@ -117,6 +117,24 @@ async def convert_docx_to_pdf(
         print(f"DEBUG: HTTP Error: {e}")
         raise HTTPException(status_code=502, detail=f"Gagal upload ke target: {e}")
 
+    # Cleanup files after successful upload
+    try:
+        if resp.status_code == 200 and resp_json and "upload_data" in resp_json:
+            # Delete local files after successful upload
+            if os.path.exists(path_docx):
+                os.remove(path_docx)
+                print(f"INFO: Deleted local DOCX file: {path_docx}")
+            
+            if os.path.exists(path_pdf):
+                os.remove(path_pdf)
+                print(f"INFO: Deleted local PDF file: {path_pdf}")
+                
+            print("INFO: Local files cleaned up successfully")
+        else:
+            print("INFO: Files retained due to upload error or unexpected response")
+    except Exception as e:
+        print(f"WARNING: Failed to cleanup local files: {e}")
+
     return JSONResponse(
         content={
             "status": "ok",
@@ -125,5 +143,6 @@ async def convert_docx_to_pdf(
             "target_post": post_url,
             "target_status": resp.status_code,
             "target_response": resp_json if resp_json is not None else resp_text,
+            "files_cleaned": resp.status_code == 200 and resp_json and "upload_data" in resp_json
         }
     )
