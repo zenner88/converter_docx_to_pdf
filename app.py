@@ -106,6 +106,12 @@ async def convert_docx_to_pdf(
             
         # Log response untuk debugging
         print(f"DEBUG: Target response text: {resp_text[:500]}")
+        print(f"DEBUG: Full target response: {resp_text}")
+        
+        # Log file info yang dikirim
+        print(f"DEBUG: Sent filename: {os.path.basename(path_pdf)}")
+        print(f"DEBUG: Local file exists: {os.path.exists(path_pdf)}")
+        print(f"DEBUG: Local file size: {os.path.getsize(path_pdf) if os.path.exists(path_pdf) else 'N/A'}")
         
     except httpx.HTTPError as e:
         print(f"DEBUG: HTTP Error: {e}")
