@@ -11,8 +11,8 @@ FastAPI API untuk konversi DOCX/DOC → PDF menggunakan LibreOffice (soffice). D
 # Dari folder pdef_generator_3/
 docker compose up --build
 # Akses
-# Health: http://127.0.0.1:8000/health
-# Docs:   http://127.0.0.1:8000/docs
+# Health: http://127.0.0.1:80/health
+# Docs:   http://127.0.0.1:80/docs
 ```
 
 ## Jalankan lokal (tanpa Docker)

@@ -26,12 +26,12 @@ python -m pip install -r requirements.txt
 
 ## Run the Server
 ```bash
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+uvicorn app:app --reload --host 0.0.0.0 --port 80
 ```
 
 Health check:
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:80/health
 ```
 
 ## Endpoint
@@ -55,14 +55,14 @@ Response (JSON):
 
 Example cURL (Windows PowerShell):
 ```powershell
-curl -Method POST http://localhost:8000/convert `
+curl -Method POST http://localhost:80/convert `
   -Form file=@"C:\path\to\file.docx" `
   -Form nomor_urut="ABC-123" `
   -Form target_url="https://app.example.com"
 ```
 Example cURL (bash):
 ```bash
-curl -X POST http://localhost:8000/convert \
+curl -X POST http://localhost:80/convert \
   -F "file=@/path/to/file.docx" \
   -F "nomor_urut=ABC-123" \
   -F "target_url=https://app.example.com"

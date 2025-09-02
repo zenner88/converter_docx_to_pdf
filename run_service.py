@@ -43,7 +43,7 @@ class FastAPIService(win32serviceutil.ServiceFramework):
             sys.executable, "-m", "uvicorn", 
             "app:app", 
             "--host", "0.0.0.0", 
-            "--port", "8000",
+            "--port", "80",
             "--workers", "1"
         ]
         

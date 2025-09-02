@@ -9,9 +9,9 @@ if exist .venv\Scripts\activate.bat (
 )
 
 REM Start FastAPI server
-echo Starting server on http://0.0.0.0:8000
+echo Starting server on http://0.0.0.0:80
 echo Press Ctrl+C to stop
 echo.
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 80 --reload
 
 pause
