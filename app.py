@@ -19,7 +19,7 @@ app = FastAPI(title="DOCX to PDF Converter", version="1.0.0")
 conversion_queue = asyncio.Queue()
 queue_status: Dict[str, Dict[str, Any]] = {}
 queue_workers_running = 0
-MAX_CONCURRENT_WORKERS = 3
+MAX_CONCURRENT_WORKERS = 10
 
 @dataclass
 class ConversionRequest:
