@@ -15,25 +15,25 @@ from fastapi.responses import JSONResponse
 from docx2pdf import convert
 import httpx
 
-# Setup logging
-def setup_logging():
-    """Setup logging configuration dengan file rotation"""
+# Setup logging untuk file
+def setup_file_logging():
+    """Setup file logging tanpa mengubah print statements"""
     # Buat direktori logs jika belum ada
     log_dir = os.path.join(os.path.dirname(__file__), "logs")
     os.makedirs(log_dir, exist_ok=True)
     
     # Setup formatter
     formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - [Worker-%(worker_id)s] - %(message)s',
+        '%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Setup root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    # Setup file logger
+    file_logger = logging.getLogger('converter_file')
+    file_logger.setLevel(logging.INFO)
     
     # Clear existing handlers
-    root_logger.handlers.clear()
+    file_logger.handlers.clear()
     
     # File handler untuk semua logs (dengan rotation)
     file_handler = RotatingFileHandler(
@@ -43,7 +43,7 @@ def setup_logging():
     )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
+    file_logger.addHandler(file_handler)
     
     # Error file handler khusus untuk errors
     error_handler = RotatingFileHandler(
@@ -53,20 +53,27 @@ def setup_logging():
     )
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(formatter)
-    root_logger.addHandler(error_handler)
+    file_logger.addHandler(error_handler)
     
-    # Console handler (optional, untuk development)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
-    ))
-    root_logger.addHandler(console_handler)
-    
-    return logging.getLogger(__name__)
+    return file_logger
 
-# Initialize logging
-logger = setup_logging()
+# Initialize file logging
+file_logger = setup_file_logging()
+
+# Fungsi helper untuk print + log ke file
+def log_print(message: str, level: str = "INFO"):
+    """Print ke console dan simpan ke file log"""
+    print(message)
+    
+    # Simpan juga ke file
+    if level == "ERROR":
+        file_logger.error(message.replace("ERROR: ", ""))
+    elif level == "WARNING":
+        file_logger.warning(message.replace("WARNING: ", ""))
+    elif level == "DEBUG":
+        file_logger.debug(message.replace("DEBUG: ", ""))
+    else:
+        file_logger.info(message.replace("INFO: ", ""))
 
 app = FastAPI(title="DOCX to PDF Converter", version="1.0.0")
 
@@ -92,11 +99,7 @@ async def process_conversion_queue(worker_id: int):
     global queue_workers_running
     queue_workers_running += 1
     
-    # Setup worker-specific logger
-    worker_logger = logging.getLogger(f"worker_{worker_id}")
-    worker_logger = logging.LoggerAdapter(worker_logger, {'worker_id': worker_id})
-    
-    worker_logger.info(f"Conversion queue worker {worker_id} started")
+    log_print(f"INFO: Conversion queue worker {worker_id} started")
     
     while True:
         try:
@@ -108,18 +111,18 @@ async def process_conversion_queue(worker_id: int):
             queue_status[request.request_id]["started_at"] = datetime.now()
             queue_status[request.request_id]["worker_id"] = worker_id
             
-            worker_logger.info(f"Processing conversion request {request.request_id} for {request.nomor_urut}")
+            log_print(f"INFO: Worker {worker_id} processing conversion request {request.request_id} for {request.nomor_urut}")
             
             try:
                 # Proses konversi
-                result = await process_single_conversion(request, worker_logger)
+                result = await process_single_conversion(request)
                 
                 # Update status menjadi completed
                 queue_status[request.request_id]["status"] = "completed"
                 queue_status[request.request_id]["completed_at"] = datetime.now()
                 queue_status[request.request_id]["result"] = result
                 
-                worker_logger.info(f"Completed conversion request {request.request_id}")
+                log_print(f"INFO: Worker {worker_id} completed conversion request {request.request_id}")
                 
             except Exception as e:
                 # Update status menjadi error
@@ -127,17 +130,17 @@ async def process_conversion_queue(worker_id: int):
                 queue_status[request.request_id]["error"] = str(e)
                 queue_status[request.request_id]["completed_at"] = datetime.now()
                 
-                worker_logger.error(f"Failed conversion request {request.request_id}: {e}", exc_info=True)
+                log_print(f"ERROR: Worker {worker_id} failed conversion request {request.request_id}: {e}", "ERROR")
             
             # Tandai task selesai di queue
             conversion_queue.task_done()
             
         except Exception as e:
-            worker_logger.error(f"Queue worker {worker_id} error: {e}", exc_info=True)
+            log_print(f"ERROR: Queue worker {worker_id} error: {e}", "ERROR")
             await asyncio.sleep(1)
 
 
-async def process_single_conversion(request: ConversionRequest, worker_logger) -> Dict[str, Any]:
+async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any]:
     """Memproses satu request konversi"""
     # Validasi nama file
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", request.nomor_urut).strip()
@@ -181,9 +184,9 @@ async def process_single_conversion(request: ConversionRequest, worker_logger) -
     file_size = os.path.getsize(path_pdf)
     max_size = 5 * 1024 * 1024  # 5MB limit
     if file_size > max_size:
-        worker_logger.warning(f"PDF file size {file_size} bytes exceeds recommended limit")
+        log_print(f"WARNING: PDF file size {file_size} bytes exceeds recommended limit", "WARNING")
     
-    worker_logger.info(f"PDF created successfully - Size: {file_size} bytes, Path: {path_pdf}")
+    log_print(f"INFO: PDF created successfully - Size: {file_size} bytes, Path: {path_pdf}")
 
     # Tentukan endpoint berdasarkan tipe
     if request.endpoint_type == "convertDua":
@@ -191,7 +194,7 @@ async def process_single_conversion(request: ConversionRequest, worker_logger) -
         max_retries = 3
     else:
         post_url = f"{request.target_url.rstrip('/')}/check/responseBalikConvert"
-        max_retries = 0
+        max_retries = 3
     
     # Kirim ke target server
     retry_delay = 1
@@ -204,7 +207,7 @@ async def process_single_conversion(request: ConversionRequest, worker_logger) -
             async with httpx.AsyncClient(timeout=timeout_config) as client:
                 with open(path_pdf, "rb") as fpdf:
                     file_size = os.path.getsize(path_pdf)
-                    worker_logger.info(f"Attempt {attempt + 1}/{max_retries + 1} - Uploading PDF size: {file_size} bytes to {post_url}")
+                    log_print(f"DEBUG: Attempt {attempt + 1}/{max_retries + 1} - Uploading PDF size: {file_size} bytes to {post_url}", "DEBUG")
                     
                     files = {"docupload": (os.path.basename(path_pdf), fpdf, "application/pdf")}
                     headers = {"User-Agent": "FastAPI-DOCX-Converter/1.0"}
@@ -215,9 +218,9 @@ async def process_single_conversion(request: ConversionRequest, worker_logger) -
                         break
                         
         except (httpx.HTTPError, httpx.TimeoutException) as e:
-            worker_logger.warning(f"Attempt {attempt + 1} failed with error: {e}")
+            log_print(f"DEBUG: Attempt {attempt + 1} failed with error: {e}", "DEBUG")
             if attempt < max_retries:
-                worker_logger.info(f"Retrying in {retry_delay} seconds...")
+                log_print(f"DEBUG: Retrying in {retry_delay} seconds...", "DEBUG")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2
                 continue
@@ -227,8 +230,8 @@ async def process_single_conversion(request: ConversionRequest, worker_logger) -
     if resp is None:
         raise Exception("Tidak ada response dari target server")
     
-    worker_logger.info(f"Target response status: {resp.status_code}")
-    worker_logger.debug(f"Target response headers: {dict(resp.headers)}")
+    log_print(f"DEBUG: Target response status: {resp.status_code}", "DEBUG")
+    log_print(f"DEBUG: Target response headers: {dict(resp.headers)}", "DEBUG")
     
     resp_text = resp.text
     try:
@@ -236,28 +239,33 @@ async def process_single_conversion(request: ConversionRequest, worker_logger) -
     except Exception:
         resp_json = None
         
-    worker_logger.debug(f"Target response text: {resp_text[:500]}")
-    worker_logger.info(f"Sent filename: {os.path.basename(path_pdf)}")
-    worker_logger.info(f"Local file size: {os.path.getsize(path_pdf)}")
+    log_print(f"DEBUG: Target response text: {resp_text[:500]}", "DEBUG")
+    log_print(f"DEBUG: Full target response: {resp_text}", "DEBUG")
+    
+    # Log file info yang dikirim
+    log_print(f"DEBUG: Sent filename: {os.path.basename(path_pdf)}", "DEBUG")
+    log_print(f"DEBUG: Local file exists: {os.path.exists(path_pdf)}", "DEBUG")
+    log_print(f"DEBUG: Local file size: {os.path.getsize(path_pdf) if os.path.exists(path_pdf) else 'N/A'}", "DEBUG")
 
     # Cleanup files setelah upload sukses
     files_cleaned = False
     try:
         if 200 <= resp.status_code < 300 and resp_json and "upload_data" in resp_json:
+            # Delete local files after successful upload
             if os.path.exists(path_docx):
                 os.remove(path_docx)
-                worker_logger.info(f"Deleted local DOCX file: {path_docx}")
+                log_print(f"INFO: Deleted local DOCX file: {path_docx}")
             
             if os.path.exists(path_pdf):
                 os.remove(path_pdf)
-                worker_logger.info(f"Deleted local PDF file: {path_pdf}")
+                log_print(f"INFO: Deleted local PDF file: {path_pdf}")
                 
             files_cleaned = True
-            worker_logger.info("Local files cleaned up successfully")
+            log_print("INFO: Local files cleaned up successfully")
         else:
-            worker_logger.info("Files retained due to upload error or unexpected response")
+            log_print("INFO: Files retained due to upload error or unexpected response")
     except Exception as e:
-        worker_logger.warning(f"Failed to cleanup local files: {e}")
+        log_print(f"WARNING: Failed to cleanup local files: {e}", "WARNING")
 
     return {
         "status": "ok",
@@ -275,7 +283,7 @@ async def startup_event():
     """Start queue workers saat aplikasi dimulai"""
     for i in range(MAX_CONCURRENT_WORKERS):
         asyncio.create_task(process_conversion_queue(i + 1))
-    logger.info(f"Started {MAX_CONCURRENT_WORKERS} conversion queue workers")
+    log_print(f"INFO: Started {MAX_CONCURRENT_WORKERS} conversion queue workers")
 
 
 @app.get("/health")
@@ -361,7 +369,7 @@ async def convert_docx_to_pdf(
     # Tambahkan ke queue
     await conversion_queue.put(conversion_request)
     
-    logger.info(f"Added conversion request {request_id} to queue for {nomor_urut}")
+    log_print(f"INFO: Added conversion request {request_id} to queue for {nomor_urut}")
     
     return JSONResponse(
         content={
@@ -419,7 +427,7 @@ async def convert_docx_to_pdf_dua(
     # Tambahkan ke queue
     await conversion_queue.put(conversion_request)
     
-    logger.info(f"Added conversion request {request_id} to queue for {nomor_urut}")
+    log_print(f"INFO: Added conversion request {request_id} to queue for {nomor_urut}")
     
     return JSONResponse(
         content={
