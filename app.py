@@ -3,6 +3,7 @@ import shutil
 import tempfile
 from typing import Optional
 import re
+import asyncio
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
@@ -210,43 +211,58 @@ async def convert_docx_to_pdf_dua(
     
     print(f"INFO: PDF created successfully - Size: {file_size} bytes, Path: {path_pdf}")
 
-    # Kirim ke target_url/check/responseBalikConvert
+    # Kirim ke target_url/check/responseBalikConvert dengan retry logic
     post_url = f"{target_url.rstrip('/')}" + "/check/responseBalikConvertDua"
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-            with open(path_pdf, "rb") as fpdf:
-                # Get file size for debugging
-                file_size = os.path.getsize(path_pdf)
-                print(f"DEBUG: Uploading PDF size: {file_size} bytes to {post_url}")
-                
-                # Target server expects 'docupload' field name
-                files = {"docupload": (os.path.basename(path_pdf), fpdf, "application/pdf")}
-                headers = {
-                    "User-Agent": "FastAPI-DOCX-Converter/1.0",
-                }
-                resp = await client.post(post_url, files=files, headers=headers)
-                
-                print(f"DEBUG: Target response status: {resp.status_code}")
-                print(f"DEBUG: Target response headers: {dict(resp.headers)}")
-                
-        resp_text = resp.text
+    max_retries = 3
+    retry_delay = 1  # Start with 1 second
+    
+    for attempt in range(max_retries + 1):
         try:
-            resp_json = resp.json()
-        except Exception:
-            resp_json = None
-            
-        # Log response untuk debugging
-        print(f"DEBUG: Target response text: {resp_text[:500]}")
-        print(f"DEBUG: Full target response: {resp_text}")
+            async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+                with open(path_pdf, "rb") as fpdf:
+                    # Get file size for debugging
+                    file_size = os.path.getsize(path_pdf)
+                    print(f"DEBUG: Attempt {attempt + 1}/{max_retries + 1} - Uploading PDF size: {file_size} bytes to {post_url}")
+                    
+                    # Target server expects 'docupload' field name
+                    files = {"docupload": (os.path.basename(path_pdf), fpdf, "application/pdf")}
+                    headers = {
+                        "User-Agent": "FastAPI-DOCX-Converter/1.0",
+                    }
+                    resp = await client.post(post_url, files=files, headers=headers)
+                    
+                    # If successful, break out of retry loop
+                    if resp.status_code < 500:
+                        break
+                        
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            print(f"DEBUG: Attempt {attempt + 1} failed with error: {e}")
+            if attempt < max_retries:
+                print(f"DEBUG: Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                continue
+            else:
+                print(f"DEBUG: All {max_retries + 1} attempts failed")
+                raise HTTPException(status_code=502, detail=f"Gagal upload ke target setelah {max_retries + 1} percobaan: {e}")
+    
+    print(f"DEBUG: Target response status: {resp.status_code}")
+    print(f"DEBUG: Target response headers: {dict(resp.headers)}")
+    
+    resp_text = resp.text
+    try:
+        resp_json = resp.json()
+    except Exception:
+        resp_json = None
         
-        # Log file info yang dikirim
-        print(f"DEBUG: Sent filename: {os.path.basename(path_pdf)}")
-        print(f"DEBUG: Local file exists: {os.path.exists(path_pdf)}")
-        print(f"DEBUG: Local file size: {os.path.getsize(path_pdf) if os.path.exists(path_pdf) else 'N/A'}")
-        
-    except httpx.HTTPError as e:
-        print(f"DEBUG: HTTP Error: {e}")
-        raise HTTPException(status_code=502, detail=f"Gagal upload ke target: {e}")
+    # Log response untuk debugging
+    print(f"DEBUG: Target response text: {resp_text[:500]}")
+    print(f"DEBUG: Full target response: {resp_text}")
+    
+    # Log file info yang dikirim
+    print(f"DEBUG: Sent filename: {os.path.basename(path_pdf)}")
+    print(f"DEBUG: Local file exists: {os.path.exists(path_pdf)}")
+    print(f"DEBUG: Local file size: {os.path.getsize(path_pdf) if os.path.exists(path_pdf) else 'N/A'}")
 
     # Cleanup files after successful upload
     try:
