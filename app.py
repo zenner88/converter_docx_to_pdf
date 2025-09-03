@@ -119,7 +119,7 @@ async def convert_docx_to_pdf(
 
     # Cleanup files after successful upload
     try:
-        if resp.status_code == 200 and resp_json and "upload_data" in resp_json:
+        if 200 <= resp.status_code < 300 and resp_json and "upload_data" in resp_json:
             # Delete local files after successful upload
             if os.path.exists(path_docx):
                 os.remove(path_docx)
@@ -143,7 +143,7 @@ async def convert_docx_to_pdf(
             "target_post": post_url,
             "target_status": resp.status_code,
             "target_response": resp_json if resp_json is not None else resp_text,
-            "files_cleaned": resp.status_code == 200 and resp_json and "upload_data" in resp_json
+            "files_cleaned": 200 <= resp.status_code < 300 and resp_json and "upload_data" in resp_json
         }
     )
 
@@ -250,7 +250,7 @@ async def convert_docx_to_pdf_dua(
 
     # Cleanup files after successful upload
     try:
-        if resp.status_code == 200 and resp_json and "upload_data" in resp_json:
+        if 200 <= resp.status_code < 300 and resp_json and "upload_data" in resp_json:
             # Delete local files after successful upload
             if os.path.exists(path_docx):
                 os.remove(path_docx)
@@ -274,6 +274,6 @@ async def convert_docx_to_pdf_dua(
             "target_post": post_url,
             "target_status": resp.status_code,
             "target_response": resp_json if resp_json is not None else resp_text,
-            "files_cleaned": resp.status_code == 200 and resp_json and "upload_data" in resp_json
+            "files_cleaned": 200 <= resp.status_code < 300 and resp_json and "upload_data" in resp_json
         }
     )
