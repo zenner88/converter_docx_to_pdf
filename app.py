@@ -18,7 +18,8 @@ app = FastAPI(title="DOCX to PDF Converter", version="1.0.0")
 # Queue untuk menampung request konversi
 conversion_queue = asyncio.Queue()
 queue_status: Dict[str, Dict[str, Any]] = {}
-queue_worker_running = False
+queue_workers_running = 0
+MAX_CONCURRENT_WORKERS = 3
 
 @dataclass
 class ConversionRequest:
@@ -31,10 +32,12 @@ class ConversionRequest:
     created_at: datetime
 
 
-async def process_conversion_queue():
-    """Background worker untuk memproses queue konversi satu per satu"""
-    global queue_worker_running
-    queue_worker_running = True
+async def process_conversion_queue(worker_id: int):
+    """Background worker untuk memproses queue konversi dengan 3 worker concurrent"""
+    global queue_workers_running
+    queue_workers_running += 1
+    
+    print(f"INFO: Conversion queue worker {worker_id} started")
     
     while True:
         try:
@@ -44,8 +47,9 @@ async def process_conversion_queue():
             # Update status menjadi processing
             queue_status[request.request_id]["status"] = "processing"
             queue_status[request.request_id]["started_at"] = datetime.now()
+            queue_status[request.request_id]["worker_id"] = worker_id
             
-            print(f"INFO: Processing conversion request {request.request_id} for {request.nomor_urut}")
+            print(f"INFO: Worker {worker_id} processing conversion request {request.request_id} for {request.nomor_urut}")
             
             try:
                 # Proses konversi
@@ -56,7 +60,7 @@ async def process_conversion_queue():
                 queue_status[request.request_id]["completed_at"] = datetime.now()
                 queue_status[request.request_id]["result"] = result
                 
-                print(f"INFO: Completed conversion request {request.request_id}")
+                print(f"INFO: Worker {worker_id} completed conversion request {request.request_id}")
                 
             except Exception as e:
                 # Update status menjadi error
@@ -64,13 +68,13 @@ async def process_conversion_queue():
                 queue_status[request.request_id]["error"] = str(e)
                 queue_status[request.request_id]["completed_at"] = datetime.now()
                 
-                print(f"ERROR: Failed conversion request {request.request_id}: {e}")
+                print(f"ERROR: Worker {worker_id} failed conversion request {request.request_id}: {e}")
             
             # Tandai task selesai di queue
             conversion_queue.task_done()
             
         except Exception as e:
-            print(f"ERROR: Queue worker error: {e}")
+            print(f"ERROR: Queue worker {worker_id} error: {e}")
             await asyncio.sleep(1)
 
 
@@ -209,9 +213,10 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
 
 @app.on_event("startup")
 async def startup_event():
-    """Start queue worker saat aplikasi dimulai"""
-    asyncio.create_task(process_conversion_queue())
-    print("INFO: Conversion queue worker started")
+    """Start 3 queue workers saat aplikasi dimulai"""
+    for i in range(MAX_CONCURRENT_WORKERS):
+        asyncio.create_task(process_conversion_queue(i + 1))
+    print(f"INFO: Started {MAX_CONCURRENT_WORKERS} conversion queue workers")
 
 
 @app.get("/health")
@@ -245,7 +250,8 @@ def get_queue_status():
     
     return {
         "queue_size": queue_size,
-        "worker_running": queue_worker_running,
+        "workers_running": queue_workers_running,
+        "max_concurrent_workers": MAX_CONCURRENT_WORKERS,
         "status_counts": status_counts,
         "recent_requests": recent_requests[:20]  # Tampilkan 20 request terakhir
     }
