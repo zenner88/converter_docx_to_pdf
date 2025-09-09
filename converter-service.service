@@ -1,0 +1,29 @@
+[Unit]
+Description=DOCX to PDF Converter Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=zenner
+Group=zenner
+WorkingDirectory=/home/zenner/Code/converter_docx_to_pdf
+Environment=PATH=/home/zenner/Code/converter_docx_to_pdf/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/zenner/Code/converter_docx_to_pdf
+ExecStartPre=/bin/bash -c 'if [ ! -d .venv ]; then python3 -m venv .venv && .venv/bin/pip install -r requirements.txt; fi'
+ExecStart=/home/zenner/Code/converter_docx_to_pdf/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 80
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=converter-service
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/zenner/Code/converter_docx_to_pdf
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart DOCX to PDF Converter Service
+After=converter-service.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart converter-service.service
+User=root
