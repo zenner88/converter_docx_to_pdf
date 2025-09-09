@@ -28,7 +28,7 @@ schtasks /delete /tn "%RESTART_TASK_NAME%" /f >nul 2>&1
 
 REM Create task to run service at startup and keep it running
 echo Creating main service task
-schtasks /create /tn "%TASK_NAME%" /tr "cmd /c cd /d \"%CURRENT_DIR%\" && .venv\Scripts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 80" /sc onstart /ru "SYSTEM" /f
+schtasks /create /tn "%TASK_NAME%" /tr "\"%CURRENT_DIR%start-service-task.bat\"" /sc onstart /ru "SYSTEM" /f
 
 REM Create task for daily restart at 5 AM
 echo Creating daily restart task
