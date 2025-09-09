@@ -26,7 +26,7 @@ echo.
 REM Create Windows Service using NSSM (Non-Sucking Service Manager)
 REM Download NSSM if not exists
 if not exist "%CURRENT_DIR%nssm.exe" (
-    echo Downloading NSSM (Non-Sucking Service Manager)...
+    echo Downloading NSSM (Non-Sucking Service Manager)
     powershell -Command "Invoke-WebRequest -Uri 'https://nssm.cc/release/nssm-2.24.zip' -OutFile '%CURRENT_DIR%nssm.zip'"
     powershell -Command "Expand-Archive -Path '%CURRENT_DIR%nssm.zip' -DestinationPath '%CURRENT_DIR%temp'"
     copy "%CURRENT_DIR%temp\nssm-2.24\win64\nssm.exe" "%CURRENT_DIR%nssm.exe"
@@ -37,14 +37,14 @@ if not exist "%CURRENT_DIR%nssm.exe" (
 REM Stop service if exists
 sc query "%SERVICE_NAME%" >nul 2>&1
 if %errorLevel% == 0 (
-    echo Stopping existing service...
+    echo Stopping existing service
     net stop "%SERVICE_NAME%" >nul 2>&1
     "%CURRENT_DIR%nssm.exe" remove "%SERVICE_NAME%" confirm >nul 2>&1
 )
 
 REM Create virtual environment if not exists
 if not exist "%CURRENT_DIR%.venv" (
-    echo Creating virtual environment...
+    echo Creating virtual environment
     python -m venv .venv
     call .venv\Scripts\activate.bat
     pip install -r requirements.txt
@@ -53,7 +53,7 @@ if not exist "%CURRENT_DIR%.venv" (
 )
 
 REM Install service using NSSM
-echo Installing Windows Service...
+echo Installing Windows Service
 "%CURRENT_DIR%nssm.exe" install "%SERVICE_NAME%" "%CURRENT_DIR%.venv\Scripts\python.exe"
 "%CURRENT_DIR%nssm.exe" set "%SERVICE_NAME%" Arguments "-m uvicorn app:app --host 0.0.0.0 --port 80"
 "%CURRENT_DIR%nssm.exe" set "%SERVICE_NAME%" DisplayName "%SERVICE_DISPLAY_NAME%"
@@ -67,11 +67,11 @@ REM Create logs directory
 if not exist "%CURRENT_DIR%logs" mkdir "%CURRENT_DIR%logs"
 
 REM Start the service
-echo Starting service...
+echo Starting service
 net start "%SERVICE_NAME%"
 
 REM Create Task Scheduler for daily restart at 5 AM
-echo Creating daily restart task...
+echo Creating daily restart task
 schtasks /delete /tn "RestartDocxToPdfConverter" /f >nul 2>&1
 
 schtasks /create /tn "RestartDocxToPdfConverter" /tr "net stop \"%SERVICE_NAME%\" && timeout /t 5 && net start \"%SERVICE_NAME%\"" /sc daily /st 05:00 /ru "SYSTEM" /f
