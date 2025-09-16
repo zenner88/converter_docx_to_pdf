@@ -154,19 +154,28 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     path_docx = os.path.join(base_dir, f"{safe_name}.docx")
     path_pdf = os.path.join(base_dir, f"{safe_name}.pdf")
 
+    # Hapus file lama jika ada (DOCX dan PDF)
+    try:
+        if os.path.exists(path_docx):
+            os.remove(path_docx)
+            log_print(f"INFO: Removed existing DOCX file: {path_docx}")
+    except Exception as e:
+        log_print(f"WARNING: Failed to remove existing DOCX file: {e}", "WARNING")
+    
+    try:
+        if os.path.exists(path_pdf):
+            os.remove(path_pdf)
+            log_print(f"INFO: Removed existing PDF file: {path_pdf}")
+    except Exception as e:
+        log_print(f"WARNING: Failed to remove existing PDF file: {e}", "WARNING")
+
     # Simpan file DOCX
     try:
         with open(path_docx, "wb") as f:
             f.write(request.file_content)
+        log_print(f"INFO: Saved new DOCX file: {path_docx}")
     except Exception as e:
         raise Exception(f"Gagal menyimpan file upload: {e}")
-
-    # Hapus PDF lama jika ada
-    try:
-        if os.path.exists(path_pdf):
-            os.remove(path_pdf)
-    except Exception:
-        pass
 
     # Konversi DOCX -> PDF
     try:
@@ -211,7 +220,11 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
                     
                     files = {"docupload": (os.path.basename(path_pdf), fpdf, "application/pdf")}
                     headers = {"User-Agent": "FastAPI-DOCX-Converter/1.0"}
-                    resp = await client.post(post_url, files=files, headers=headers)
+                    # Add data parameter to force overwrite existing files
+                    data = {"overwrite": "true", "force_replace": "1"}
+                    log_print(f"DEBUG: Sending overwrite parameters: {data}", "DEBUG")
+                    log_print(f"DEBUG: Uploading file: {os.path.basename(path_pdf)}", "DEBUG")
+                    resp = await client.post(post_url, files=files, headers=headers, data=data)
                     
                     # Jika sukses atau bukan server error, keluar dari retry loop
                     if resp.status_code < 500:
