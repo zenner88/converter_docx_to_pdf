@@ -144,45 +144,44 @@ async def process_conversion_queue(worker_id: int):
 
 
 def validate_docx_file(file_path: str) -> bool:
-    """Validasi apakah file DOCX valid dan tidak corrupt"""
+    """Validasi dasar apakah file DOCX dapat dibaca - lebih permisif"""
     try:
         # Check if file exists and has content
         if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
             log_print(f"ERROR: File tidak ada atau kosong: {file_path}", "ERROR")
             return False
         
-        # Check if it's a valid ZIP file (DOCX is basically a ZIP)
+        # Basic ZIP validation - hanya cek apakah bisa dibuka sebagai ZIP
         try:
             with zipfile.ZipFile(file_path, 'r') as zip_file:
-                # Check for required DOCX structure
-                required_files = ['[Content_Types].xml', 'word/document.xml']
+                # Cek apakah ada file minimal yang menunjukkan ini DOCX
                 zip_contents = zip_file.namelist()
                 
-                for required_file in required_files:
-                    if required_file not in zip_contents:
-                        log_print(f"ERROR: File DOCX tidak memiliki struktur yang valid - missing {required_file}", "ERROR")
-                        return False
+                # Cek minimal ada salah satu dari file penting ini
+                important_files = [
+                    '[Content_Types].xml',
+                    'word/document.xml',
+                    '_rels/.rels'
+                ]
                 
-                # Try to read and parse the main document.xml
-                try:
-                    document_xml = zip_file.read('word/document.xml')
-                    ET.fromstring(document_xml)
-                    log_print(f"INFO: File DOCX valid: {file_path}")
+                has_docx_structure = any(file in zip_contents for file in important_files)
+                
+                if not has_docx_structure:
+                    log_print(f"WARNING: File tidak memiliki struktur DOCX standar, tapi akan dicoba konversi: {file_path}", "WARNING")
+                    # Tetap return True, biarkan docx2pdf yang menentukan
                     return True
-                except ET.ParseError as e:
-                    log_print(f"ERROR: File DOCX corrupt - XML tidak valid: {e}", "ERROR")
-                    return False
-                except Exception as e:
-                    log_print(f"ERROR: Gagal membaca document.xml: {e}", "ERROR")
-                    return False
+                
+                log_print(f"INFO: File DOCX basic validation passed: {file_path}")
+                return True
                     
         except zipfile.BadZipFile:
             log_print(f"ERROR: File bukan ZIP/DOCX yang valid: {file_path}", "ERROR")
             return False
             
     except Exception as e:
-        log_print(f"ERROR: Gagal validasi file DOCX: {e}", "ERROR")
-        return False
+        log_print(f"WARNING: Gagal validasi file DOCX, akan dicoba konversi: {e}", "WARNING")
+        # Jika validasi gagal karena alasan lain, biarkan docx2pdf yang coba
+        return True
 
 
 def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 120) -> bool:
