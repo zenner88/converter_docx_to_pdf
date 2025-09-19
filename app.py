@@ -9,6 +9,9 @@ from datetime import datetime
 from dataclasses import dataclass
 import logging
 from logging.handlers import RotatingFileHandler
+import zipfile
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
@@ -140,8 +143,74 @@ async def process_conversion_queue(worker_id: int):
             await asyncio.sleep(1)
 
 
+def validate_docx_file(file_path: str) -> bool:
+    """Validasi apakah file DOCX valid dan tidak corrupt"""
+    try:
+        # Check if file exists and has content
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            log_print(f"ERROR: File tidak ada atau kosong: {file_path}", "ERROR")
+            return False
+        
+        # Check if it's a valid ZIP file (DOCX is basically a ZIP)
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zip_file:
+                # Check for required DOCX structure
+                required_files = ['[Content_Types].xml', 'word/document.xml']
+                zip_contents = zip_file.namelist()
+                
+                for required_file in required_files:
+                    if required_file not in zip_contents:
+                        log_print(f"ERROR: File DOCX tidak memiliki struktur yang valid - missing {required_file}", "ERROR")
+                        return False
+                
+                # Try to read and parse the main document.xml
+                try:
+                    document_xml = zip_file.read('word/document.xml')
+                    ET.fromstring(document_xml)
+                    log_print(f"INFO: File DOCX valid: {file_path}")
+                    return True
+                except ET.ParseError as e:
+                    log_print(f"ERROR: File DOCX corrupt - XML tidak valid: {e}", "ERROR")
+                    return False
+                except Exception as e:
+                    log_print(f"ERROR: Gagal membaca document.xml: {e}", "ERROR")
+                    return False
+                    
+        except zipfile.BadZipFile:
+            log_print(f"ERROR: File bukan ZIP/DOCX yang valid: {file_path}", "ERROR")
+            return False
+            
+    except Exception as e:
+        log_print(f"ERROR: Gagal validasi file DOCX: {e}", "ERROR")
+        return False
+
+
+def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 120) -> bool:
+    """Konversi DOCX ke PDF dengan timeout untuk mencegah hanging"""
+    def do_conversion():
+        try:
+            convert(docx_path, pdf_path)
+            return True
+        except Exception as e:
+            log_print(f"ERROR: Conversion failed: {e}", "ERROR")
+            raise e
+    
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(do_conversion)
+        try:
+            result = future.result(timeout=timeout_seconds)
+            return result
+        except FutureTimeoutError:
+            log_print(f"ERROR: Conversion timeout after {timeout_seconds} seconds", "ERROR")
+            # Try to cancel the future (may not work for all operations)
+            future.cancel()
+            raise Exception(f"Konversi timeout setelah {timeout_seconds} detik. File mungkin corrupt atau terlalu besar.")
+        except Exception as e:
+            raise e
+
+
 async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any]:
-    """Memproses satu request konversi"""
+    """Memproses satu request konversi dengan enhanced error handling"""
     # Validasi nama file
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", request.nomor_urut).strip()
     if not safe_name or safe_name in {".", ".."}:
@@ -154,37 +223,75 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     path_docx = os.path.join(base_dir, f"{safe_name}.docx")
     path_pdf = os.path.join(base_dir, f"{safe_name}.pdf")
 
-    # Hapus file lama jika ada (DOCX dan PDF)
+    # Cleanup function untuk membersihkan file jika terjadi error
+    def cleanup_files():
+        for file_path in [path_docx, path_pdf]:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    log_print(f"INFO: Cleaned up file: {file_path}")
+            except Exception as e:
+                log_print(f"WARNING: Failed to cleanup file {file_path}: {e}", "WARNING")
+
     try:
-        if os.path.exists(path_docx):
-            os.remove(path_docx)
-            log_print(f"INFO: Removed existing DOCX file: {path_docx}")
-    except Exception as e:
-        log_print(f"WARNING: Failed to remove existing DOCX file: {e}", "WARNING")
+        # Hapus file lama jika ada (DOCX dan PDF)
+        try:
+            if os.path.exists(path_docx):
+                os.remove(path_docx)
+                log_print(f"INFO: Removed existing DOCX file: {path_docx}")
+        except Exception as e:
+            log_print(f"WARNING: Failed to remove existing DOCX file: {e}", "WARNING")
+        
+        try:
+            if os.path.exists(path_pdf):
+                os.remove(path_pdf)
+                log_print(f"INFO: Removed existing PDF file: {path_pdf}")
+        except Exception as e:
+            log_print(f"WARNING: Failed to remove existing PDF file: {e}", "WARNING")
+
+        # Simpan file DOCX
+        try:
+            with open(path_docx, "wb") as f:
+                f.write(request.file_content)
+            log_print(f"INFO: Saved new DOCX file: {path_docx}")
+        except Exception as e:
+            cleanup_files()
+            raise Exception(f"Gagal menyimpan file upload: {e}")
+
+        # Validasi file DOCX sebelum konversi
+        if not validate_docx_file(path_docx):
+            cleanup_files()
+            raise Exception(
+                f"File DOCX corrupt atau tidak valid. File tidak dapat dikonversi. "
+                f"Silakan periksa file dan upload ulang dengan file yang valid."
+            )
+
+        # Konversi DOCX -> PDF dengan timeout
+        try:
+            log_print(f"INFO: Starting conversion for {safe_name} with 120s timeout")
+            await asyncio.get_event_loop().run_in_executor(
+                None, convert_with_timeout, path_docx, path_pdf, 120
+            )
+            log_print(f"INFO: Conversion completed successfully for {safe_name}")
+        except Exception as e:
+            cleanup_files()
+            error_msg = str(e)
+            if "timeout" in error_msg.lower():
+                raise Exception(
+                    f"Konversi timeout setelah 120 detik. File mungkin corrupt, terlalu besar, atau kompleks. "
+                    f"Silakan periksa file dan coba lagi dengan file yang lebih sederhana. Error: {error_msg}"
+                )
+            else:
+                raise Exception(
+                    f"Gagal konversi DOCX ke PDF. Pastikan menjalankan di Windows/Mac "
+                    f"dengan Microsoft Word terpasang (docx2pdf membutuhkan Word). "
+                    f"File mungkin corrupt atau format tidak didukung. Error: {error_msg}"
+                )
     
-    try:
-        if os.path.exists(path_pdf):
-            os.remove(path_pdf)
-            log_print(f"INFO: Removed existing PDF file: {path_pdf}")
     except Exception as e:
-        log_print(f"WARNING: Failed to remove existing PDF file: {e}", "WARNING")
-
-    # Simpan file DOCX
-    try:
-        with open(path_docx, "wb") as f:
-            f.write(request.file_content)
-        log_print(f"INFO: Saved new DOCX file: {path_docx}")
-    except Exception as e:
-        raise Exception(f"Gagal menyimpan file upload: {e}")
-
-    # Konversi DOCX -> PDF
-    try:
-        convert(path_docx, path_pdf)
-    except Exception as e:
-        raise Exception(
-            f"Gagal konversi DOCX ke PDF. Pastikan menjalankan di Windows/Mac "
-            f"dengan Microsoft Word terpasang (docx2pdf membutuhkan Word). Error: {str(e)}"
-        )
+        # Cleanup files in case of any error
+        cleanup_files()
+        raise e
 
     if not os.path.exists(path_pdf):
         raise Exception("File PDF tidak ditemukan setelah konversi")
