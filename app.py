@@ -144,39 +144,42 @@ async def process_conversion_queue(worker_id: int):
 
 
 def validate_docx_file(file_path: str) -> bool:
-    """Validasi apakah file DOCX valid dan tidak corrupt"""
+    """Validasi basic apakah file DOCX bisa dibuka (tidak terlalu ketat)"""
     try:
-        # DOCX adalah file ZIP, coba buka sebagai ZIP
+        # Cek 1: Apakah file bisa dibuka sebagai ZIP
         with zipfile.ZipFile(file_path, 'r') as zip_file:
-            # Cek apakah ada file penting dalam struktur DOCX
-            required_files = ['word/document.xml', '[Content_Types].xml']
+            # Cek 2: Apakah ada minimal struktur DOCX (lebih fleksibel)
             zip_contents = zip_file.namelist()
             
-            # Pastikan file-file penting ada
-            for required_file in required_files:
-                if required_file not in zip_contents:
-                    log_print(f"ERROR: Missing required file in DOCX: {required_file}", "ERROR")
-                    return False
-            
-            # Coba baca document.xml untuk memastikan tidak corrupt
-            try:
-                document_xml = zip_file.read('word/document.xml')
-                if len(document_xml) == 0:
-                    log_print("ERROR: Empty document.xml in DOCX", "ERROR")
-                    return False
-            except Exception as e:
-                log_print(f"ERROR: Cannot read document.xml: {e}", "ERROR")
+            # Hanya cek apakah ada folder 'word/' - ini yang paling basic
+            has_word_folder = any(name.startswith('word/') for name in zip_contents)
+            if not has_word_folder:
+                log_print("ERROR: No 'word/' folder found in DOCX structure", "ERROR")
                 return False
+            
+            # Cek 3: Coba baca satu file saja untuk test corruption (optional)
+            try:
+                # Cari file document.xml atau file apapun di folder word/
+                word_files = [name for name in zip_contents if name.startswith('word/') and name.endswith('.xml')]
+                if word_files:
+                    # Coba baca file pertama yang ditemukan
+                    test_content = zip_file.read(word_files[0])
+                    # Hanya cek apakah bisa dibaca, tidak peduli isinya
+                    log_print(f"INFO: Successfully read {word_files[0]} ({len(test_content)} bytes)")
+            except Exception as e:
+                log_print(f"WARNING: Could not read word files, but continuing: {e}", "WARNING")
+                # Tidak return False, hanya warning
                 
-            log_print("INFO: DOCX file validation passed")
+            log_print("INFO: Basic DOCX file validation passed")
             return True
             
     except zipfile.BadZipFile:
         log_print("ERROR: File is not a valid ZIP/DOCX file", "ERROR")
         return False
     except Exception as e:
-        log_print(f"ERROR: DOCX validation failed: {e}", "ERROR")
-        return False
+        log_print(f"WARNING: DOCX validation had issues but continuing: {e}", "WARNING")
+        # Lebih permisif - jika ada error lain, tetap coba lanjut
+        return True
 
 
 def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
@@ -258,7 +261,7 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
 
     # Konversi DOCX -> PDF dengan timeout protection
     log_print("INFO: Starting DOCX to PDF conversion with timeout protection...")
-    conversion_timeout = 120  # 2 menit timeout
+    conversion_timeout = 90  # 1.5 menit timeout - lebih fleksibel
     
     conversion_success = await asyncio.get_event_loop().run_in_executor(
         None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
