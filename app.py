@@ -84,7 +84,7 @@ app = FastAPI(title="DOCX to PDF Converter", version="1.0.0")
 conversion_queue = asyncio.Queue()
 queue_status: Dict[str, Dict[str, Any]] = {}
 queue_workers_running = 0
-MAX_CONCURRENT_WORKERS = 10
+MAX_CONCURRENT_WORKERS = 3  # Reduced from 10 to avoid COM threading issues
 
 @dataclass
 class ConversionRequest:
@@ -186,10 +186,40 @@ def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 6
     """Konversi DOCX ke PDF dengan timeout protection"""
     def conversion_task():
         try:
+            # Initialize COM untuk thread ini (Windows only)
+            import sys
+            if sys.platform == "win32":
+                try:
+                    import pythoncom
+                    pythoncom.CoInitialize()
+                    log_print("DEBUG: COM initialized for conversion thread", "DEBUG")
+                except ImportError:
+                    log_print("WARNING: pythoncom not available, COM may not work properly", "WARNING")
+                except Exception as e:
+                    log_print(f"WARNING: COM initialization failed: {e}", "WARNING")
+            
+            # Lakukan konversi
             convert(docx_path, pdf_path)
+            
+            # Cleanup COM
+            if sys.platform == "win32":
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                    log_print("DEBUG: COM uninitialized for conversion thread", "DEBUG")
+                except:
+                    pass
+                    
             return True
         except Exception as e:
             log_print(f"ERROR: Conversion failed: {e}", "ERROR")
+            # Cleanup COM jika error
+            if sys.platform == "win32":
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except:
+                    pass
             return False
     
     # Gunakan ThreadPoolExecutor dengan timeout
