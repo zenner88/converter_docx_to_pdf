@@ -9,6 +9,9 @@ from datetime import datetime
 from dataclasses import dataclass
 import logging
 from logging.handlers import RotatingFileHandler
+import zipfile
+import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
@@ -81,7 +84,7 @@ app = FastAPI(title="DOCX to PDF Converter", version="1.0.0")
 conversion_queue = asyncio.Queue()
 queue_status: Dict[str, Dict[str, Any]] = {}
 queue_workers_running = 0
-MAX_CONCURRENT_WORKERS = 1
+MAX_CONCURRENT_WORKERS = 10
 
 @dataclass
 class ConversionRequest:
@@ -140,6 +143,71 @@ async def process_conversion_queue(worker_id: int):
             await asyncio.sleep(1)
 
 
+def validate_docx_file(file_path: str) -> bool:
+    """Validasi apakah file DOCX valid dan tidak corrupt"""
+    try:
+        # DOCX adalah file ZIP, coba buka sebagai ZIP
+        with zipfile.ZipFile(file_path, 'r') as zip_file:
+            # Cek apakah ada file penting dalam struktur DOCX
+            required_files = ['word/document.xml', '[Content_Types].xml']
+            zip_contents = zip_file.namelist()
+            
+            # Pastikan file-file penting ada
+            for required_file in required_files:
+                if required_file not in zip_contents:
+                    log_print(f"ERROR: Missing required file in DOCX: {required_file}", "ERROR")
+                    return False
+            
+            # Coba baca document.xml untuk memastikan tidak corrupt
+            try:
+                document_xml = zip_file.read('word/document.xml')
+                if len(document_xml) == 0:
+                    log_print("ERROR: Empty document.xml in DOCX", "ERROR")
+                    return False
+            except Exception as e:
+                log_print(f"ERROR: Cannot read document.xml: {e}", "ERROR")
+                return False
+                
+            log_print("INFO: DOCX file validation passed")
+            return True
+            
+    except zipfile.BadZipFile:
+        log_print("ERROR: File is not a valid ZIP/DOCX file", "ERROR")
+        return False
+    except Exception as e:
+        log_print(f"ERROR: DOCX validation failed: {e}", "ERROR")
+        return False
+
+
+def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
+    """Konversi DOCX ke PDF dengan timeout protection"""
+    def conversion_task():
+        try:
+            convert(docx_path, pdf_path)
+            return True
+        except Exception as e:
+            log_print(f"ERROR: Conversion failed: {e}", "ERROR")
+            return False
+    
+    # Gunakan ThreadPoolExecutor dengan timeout
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            future = executor.submit(conversion_task)
+            result = future.result(timeout=timeout_seconds)
+            return result
+        except FutureTimeoutError:
+            log_print(f"ERROR: Conversion timeout after {timeout_seconds} seconds", "ERROR")
+            # Coba terminate proses yang hang
+            try:
+                future.cancel()
+            except:
+                pass
+            return False
+        except Exception as e:
+            log_print(f"ERROR: Conversion executor error: {e}", "ERROR")
+            return False
+
+
 async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any]:
     """Memproses satu request konversi"""
     # Validasi nama file
@@ -177,13 +245,38 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     except Exception as e:
         raise Exception(f"Gagal menyimpan file upload: {e}")
 
-    # Konversi DOCX -> PDF
-    try:
-        convert(path_docx, path_pdf)
-    except Exception as e:
+    # Validasi file DOCX sebelum konversi
+    log_print("INFO: Validating DOCX file structure...")
+    if not validate_docx_file(path_docx):
+        # Cleanup file yang corrupt
+        try:
+            if os.path.exists(path_docx):
+                os.remove(path_docx)
+        except:
+            pass
+        raise Exception("File DOCX corrupt atau tidak valid. Silakan periksa file dan coba lagi.")
+
+    # Konversi DOCX -> PDF dengan timeout protection
+    log_print("INFO: Starting DOCX to PDF conversion with timeout protection...")
+    conversion_timeout = 120  # 2 menit timeout
+    
+    conversion_success = await asyncio.get_event_loop().run_in_executor(
+        None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
+    )
+    
+    if not conversion_success:
+        # Cleanup files jika konversi gagal
+        try:
+            if os.path.exists(path_docx):
+                os.remove(path_docx)
+            if os.path.exists(path_pdf):
+                os.remove(path_pdf)
+        except:
+            pass
         raise Exception(
-            f"Gagal konversi DOCX ke PDF. Pastikan menjalankan di Windows/Mac "
-            f"dengan Microsoft Word terpasang (docx2pdf membutuhkan Word). Error: {str(e)}"
+            f"Gagal konversi DOCX ke PDF. Kemungkinan file corrupt, timeout, atau "
+            f"Microsoft Word tidak tersedia. Pastikan menjalankan di Windows/Mac "
+            f"dengan Microsoft Word terpasang."
         )
 
     if not os.path.exists(path_pdf):
