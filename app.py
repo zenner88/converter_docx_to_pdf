@@ -312,20 +312,21 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     except Exception as e:
         raise Exception(f"Gagal menyimpan file upload: {e}")
 
-    # Validasi file DOCX sebelum konversi
-    log_print("INFO: Validating DOCX file structure...")
-    if not validate_docx_file(path_docx):
-        # Cleanup file yang corrupt
-        try:
-            if os.path.exists(path_docx):
-                os.remove(path_docx)
-        except:
-            pass
-        raise Exception("File DOCX corrupt atau tidak valid. Silakan periksa file dan coba lagi.")
+    # Validasi file DOCX sebelum konversi (dinonaktifkan sementara sesuai permintaan)
+    # log_print("INFO: Validating DOCX file structure...")
+    # if not validate_docx_file(path_docx):
+    #     # Cleanup file yang corrupt
+    #     try:
+    #         if os.path.exists(path_docx):
+    #             os.remove(path_docx)
+    #     except:
+    #         pass
+    #     raise Exception("File DOCX corrupt atau tidak valid. Silakan periksa file dan coba lagi.")
+    log_print("INFO: Skipping DOCX validation (temporary)")
 
     # Konversi DOCX -> PDF dengan timeout protection
-    log_print("INFO: Starting DOCX to PDF conversion with timeout protection...")
-    conversion_timeout = 90  # 1.5 menit timeout - lebih fleksibel
+    log_print("INFO: Starting DOCX to PDF conversion with timeout protection (5400s = 90 minutes)...")
+    conversion_timeout = 5400  # 90 menit timeout
     
     conversion_success = await asyncio.get_event_loop().run_in_executor(
         None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
@@ -515,12 +516,12 @@ async def convert_docx_to_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal membaca file upload: {e}")
     
-    # Validasi awal konten DOCX sebelum diproses
-    is_valid, validation_message = validate_docx_content(file_content)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=f"File DOCX tidak valid: {validation_message}")
-    
-    log_print(f"INFO: Initial file validation passed for {nomor_urut}: {validation_message}")
+    # Validasi awal dinonaktifkan sementara sesuai permintaan
+    # is_valid, validation_message = validate_docx_content(file_content)
+    # if not is_valid:
+    #     raise HTTPException(status_code=400, detail=f"File DOCX tidak valid: {validation_message}")
+    # log_print(f"INFO: Initial file validation passed for {nomor_urut}: {validation_message}")
+    log_print(f"INFO: Skipping initial DOCX validation for {nomor_urut} (temporary)")
     
     # Generate unique request ID
     request_id = str(uuid.uuid4())
@@ -580,12 +581,12 @@ async def convert_docx_to_pdf_dua(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal membaca file upload: {e}")
     
-    # Validasi awal konten DOCX sebelum diproses
-    is_valid, validation_message = validate_docx_content(file_content)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=f"File DOCX tidak valid: {validation_message}")
-    
-    log_print(f"INFO: Initial file validation passed for {nomor_urut}: {validation_message}")
+    # Validasi awal dinonaktifkan sementara sesuai permintaan
+    # is_valid, validation_message = validate_docx_content(file_content)
+    # if not is_valid:
+    #     raise HTTPException(status_code=400, detail=f"File DOCX tidak valid: {validation_message}")
+    # log_print(f"INFO: Initial file validation passed for {nomor_urut}: {validation_message}")
+    log_print(f"INFO: Skipping initial DOCX validation for {nomor_urut} (temporary)")
     
     # Generate unique request ID
     request_id = str(uuid.uuid4())
