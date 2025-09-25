@@ -217,7 +217,7 @@ def validate_docx_content(file_content: bytes) -> tuple[bool, str]:
 
 
 def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
-    """Konversi DOCX ke PDF dengan timeout protection"""
+    """Konversi DOCX ke PDF dengan timeout protection (docx2pdf)."""
     def conversion_task():
         try:
             # Initialize COM untuk thread ini (Windows only)
@@ -232,7 +232,7 @@ def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 6
                 except Exception as e:
                     log_print(f"WARNING: COM initialization failed: {e}", "WARNING")
             
-            # Lakukan konversi
+            # Lakukan konversi (menggunakan Microsoft Word/Automator tergantung platform)
             convert(docx_path, pdf_path)
             
             # Cleanup COM
@@ -241,19 +241,20 @@ def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 6
                     import pythoncom
                     pythoncom.CoUninitialize()
                     log_print("DEBUG: COM uninitialized for conversion thread", "DEBUG")
-                except:
+                except Exception:
                     pass
-                    
+            
             return True
         except Exception as e:
             log_print(f"ERROR: Conversion failed: {e}", "ERROR")
             # Cleanup COM jika error
-            if sys.platform == "win32":
-                try:
-                    import pythoncom
-                    pythoncom.CoUninitialize()
-                except:
-                    pass
+            try:
+                import sys as _sys
+                if _sys.platform == "win32":
+                    import pythoncom as _pythoncom
+                    _pythoncom.CoUninitialize()
+            except Exception:
+                pass
             return False
     
     # Gunakan ThreadPoolExecutor dengan timeout
@@ -325,8 +326,8 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     log_print("INFO: Skipping DOCX validation (temporary)")
 
     # Konversi DOCX -> PDF dengan timeout protection
-    log_print("INFO: Starting DOCX to PDF conversion with timeout protection (5400s = 90 minutes)...")
-    conversion_timeout = 5400  # 90 menit timeout
+    log_print("INFO: Starting DOCX to PDF conversion with timeout protection (90s)...")
+    conversion_timeout = 90  # 90 detik timeout
     
     conversion_success = await asyncio.get_event_loop().run_in_executor(
         None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
