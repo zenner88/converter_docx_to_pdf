@@ -144,42 +144,76 @@ async def process_conversion_queue(worker_id: int):
 
 
 def validate_docx_file(file_path: str) -> bool:
-    """Validasi basic apakah file DOCX bisa dibuka (tidak terlalu ketat)"""
+    """Validasi sederhana: pastikan file bisa dibuka sebagai ZIP dan punya struktur dasar DOCX.
+    Tujuan: hanya mendeteksi file corrupt/tidak bisa dibuka. Sangat permisif."""
     try:
-        # Cek 1: Apakah file bisa dibuka sebagai ZIP
         with zipfile.ZipFile(file_path, 'r') as zip_file:
-            # Cek 2: Apakah ada minimal struktur DOCX (lebih fleksibel)
-            zip_contents = zip_file.namelist()
-            
-            # Hanya cek apakah ada folder 'word/' - ini yang paling basic
-            has_word_folder = any(name.startswith('word/') for name in zip_contents)
-            if not has_word_folder:
-                log_print("ERROR: No 'word/' folder found in DOCX structure", "ERROR")
+            # Test integritas ZIP (akan return nama file rusak jika ada)
+            bad_file = zip_file.testzip()
+            if bad_file is not None:
+                log_print(f"ERROR: ZIP corruption detected in entry: {bad_file}", "ERROR")
                 return False
-            
-            # Cek 3: Coba baca satu file saja untuk test corruption (optional)
+
+            contents = zip_file.namelist()
+
+            # Cek minimal struktur DOCX: folder word/ dan file utama document.xml
+            if not any(name.startswith('word/') for name in contents):
+                log_print("ERROR: Missing 'word/' folder in DOCX", "ERROR")
+                return False
+
+            if 'word/document.xml' not in contents:
+                log_print("ERROR: Missing 'word/document.xml' in DOCX", "ERROR")
+                return False
+
+            # Coba baca sebagian kecil dari document.xml untuk memastikan bisa dibaca
             try:
-                # Cari file document.xml atau file apapun di folder word/
-                word_files = [name for name in zip_contents if name.startswith('word/') and name.endswith('.xml')]
-                if word_files:
-                    # Coba baca file pertama yang ditemukan
-                    test_content = zip_file.read(word_files[0])
-                    # Hanya cek apakah bisa dibaca, tidak peduli isinya
-                    log_print(f"INFO: Successfully read {word_files[0]} ({len(test_content)} bytes)")
+                sample = zip_file.read('word/document.xml')[:100]
+                _ = len(sample)  # trigger read
             except Exception as e:
-                log_print(f"WARNING: Could not read word files, but continuing: {e}", "WARNING")
-                # Tidak return False, hanya warning
-                
-            log_print("INFO: Basic DOCX file validation passed")
+                log_print(f"ERROR: Unable to read 'word/document.xml': {e}", "ERROR")
+                return False
+
+            log_print("INFO: Simple DOCX validation passed (file can be opened and basic structure present)")
             return True
-            
     except zipfile.BadZipFile:
-        log_print("ERROR: File is not a valid ZIP/DOCX file", "ERROR")
+        log_print("ERROR: File is not a valid ZIP/DOCX (corrupt)", "ERROR")
         return False
     except Exception as e:
-        log_print(f"WARNING: DOCX validation had issues but continuing: {e}", "WARNING")
-        # Lebih permisif - jika ada error lain, tetap coba lanjut
-        return True
+        # Permisif: jika error tak terduga, anggap gagal untuk keamanan
+        log_print(f"ERROR: Simple DOCX validation error: {e}", "ERROR")
+        return False
+
+
+def validate_docx_content(file_content: bytes) -> tuple[bool, str]:
+    """Validasi awal yang sederhana untuk memastikan file bukan corrupt.
+    Hanya cek bisa dibuka sebagai ZIP dan memiliki struktur dasar DOCX."""
+    try:
+        # Buat temporary file lalu coba buka sebagai ZIP
+        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_file:
+            temp_file.write(file_content)
+            temp_file.flush()
+
+            try:
+                with zipfile.ZipFile(temp_file.name, 'r') as zip_file:
+                    names = zip_file.namelist()
+                    if not any(n.startswith('word/') for n in names):
+                        return False, "Folder 'word/' tidak ditemukan"
+                    if 'word/document.xml' not in names:
+                        return False, "File 'word/document.xml' tidak ditemukan"
+                    # Coba baca sedikit untuk memastikan dapat diakses
+                    _ = zip_file.read('word/document.xml')[:64]
+                return True, "File dapat dibuka dan struktur dasar tersedia"
+            except zipfile.BadZipFile:
+                return False, "File corrupt/bukan ZIP DOCX yang valid"
+            except Exception as e:
+                return False, f"Gagal membuka konten DOCX: {e}"
+            finally:
+                try:
+                    os.unlink(temp_file.name)
+                except Exception:
+                    pass
+    except Exception as e:
+        return False, f"Error validasi awal: {e}"
 
 
 def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
@@ -481,6 +515,13 @@ async def convert_docx_to_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal membaca file upload: {e}")
     
+    # Validasi awal konten DOCX sebelum diproses
+    is_valid, validation_message = validate_docx_content(file_content)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=f"File DOCX tidak valid: {validation_message}")
+    
+    log_print(f"INFO: Initial file validation passed for {nomor_urut}: {validation_message}")
+    
     # Generate unique request ID
     request_id = str(uuid.uuid4())
     
@@ -538,6 +579,13 @@ async def convert_docx_to_pdf_dua(
         file_content = await file.read()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal membaca file upload: {e}")
+    
+    # Validasi awal konten DOCX sebelum diproses
+    is_valid, validation_message = validate_docx_content(file_content)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=f"File DOCX tidak valid: {validation_message}")
+    
+    log_print(f"INFO: Initial file validation passed for {nomor_urut}: {validation_message}")
     
     # Generate unique request ID
     request_id = str(uuid.uuid4())
