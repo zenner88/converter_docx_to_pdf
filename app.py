@@ -11,6 +11,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import zipfile
 import signal
+import sys
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
@@ -78,7 +80,28 @@ def log_print(message: str, level: str = "INFO"):
     else:
         file_logger.info(message.replace("INFO: ", ""))
 
+# Filter untuk menyembunyikan access log GET /queue/status dari uvicorn
+class _QueueStatusAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        # Drop log yang berisi path /queue/status
+        return "/queue/status" not in msg
+
+def enable_queue_status_log_suppression():
+    try:
+        access_logger = logging.getLogger("uvicorn.access")
+        access_logger.addFilter(_QueueStatusAccessLogFilter())
+        log_print("INFO: Uvicorn access log for GET /queue/status is suppressed")
+    except Exception as e:
+        log_print(f"WARNING: Failed to add access log filter: {e}", "WARNING")
+
 app = FastAPI(title="DOCX to PDF Converter", version="1.0.0")
+
+# Aktifkan suppression untuk akses log /queue/status
+enable_queue_status_log_suppression()
 
 # Queue untuk menampung request konversi
 conversion_queue = asyncio.Queue()
@@ -276,6 +299,147 @@ def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 6
             return False
 
 
+def _find_soffice_executable() -> Optional[str]:
+    """Cari executable LibreOffice (soffice) dengan beberapa strategi.
+    Urutan: ENV var -> lokasi default Windows -> PATH.
+    """
+    # 1) Cek dari ENV var LIBREOFFICE_PATH (bisa file atau folder)
+    env_path = os.getenv("LIBREOFFICE_PATH", "").strip().strip('"')
+    if env_path:
+        try:
+            candidate_paths = []
+            if os.path.isdir(env_path):
+                # Di Windows, prefer soffice.com untuk non-GUI
+                if sys.platform == "win32":
+                    candidate_paths += [
+                        os.path.join(env_path, "soffice.com"),
+                        os.path.join(env_path, "soffice.exe"),
+                    ]
+                else:
+                    candidate_paths.append(os.path.join(env_path, "soffice"))
+            else:
+                candidate_paths.append(env_path)
+
+            for p in candidate_paths:
+                if os.path.isfile(p):
+                    log_print(f"INFO: Using LibreOffice from LIBREOFFICE_PATH: {p}")
+                    return p
+        except Exception:
+            pass
+
+    # 2) Cek lokasi default Windows
+    if sys.platform == "win32":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        default_dirs = [
+            os.path.join(program_files, "LibreOffice", "program"),
+            os.path.join(program_files_x86, "LibreOffice", "program"),
+        ]
+        for d in default_dirs:
+            for exe in ("soffice.com", "soffice.exe"):
+                p = os.path.join(d, exe)
+                if os.path.isfile(p):
+                    log_print(f"INFO: Found LibreOffice at default Windows path: {p}")
+                    return p
+
+    # 3) Coba beberapa nama umum via PATH
+    for name in ["soffice", "libreoffice", "soffice.com"]:
+        path = shutil.which(name)
+        if path:
+            log_print(f"INFO: Found LibreOffice via PATH: {path}")
+            return path
+
+    return None
+
+
+def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
+    """
+    Konversi DOCX ke PDF menggunakan LibreOffice (headless) dengan timeout.
+    Menghindari hang dengan menjalankan proses dan mematikan jika timeout.
+    """
+    soffice = _find_soffice_executable()
+    if not soffice:
+        log_print("WARNING: LibreOffice (soffice) not found via ENV/default/PATH", "WARNING")
+        return False
+
+    outdir = os.path.dirname(pdf_path) or os.getcwd()
+
+    cmd = [
+        soffice,
+        "--headless",
+        "--norestore",
+        "--nolockcheck",
+        "--nodefault",
+        "--nofirststartwizard",
+        "--convert-to",
+        "pdf:writer_pdf_Export",
+        "--outdir",
+        outdir,
+        docx_path,
+    ]
+
+    log_print(f"INFO: Trying conversion via LibreOffice: {' '.join(cmd)}")
+    try:
+        # Windows: gunakan creationflags; POSIX: preexec_fn opsional
+        kwargs = {}
+        if sys.platform == "win32":
+            try:
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            except Exception:
+                pass
+        else:
+            kwargs["preexec_fn"] = os.setsid if hasattr(os, "setsid") else None
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            log_print(f"ERROR: LibreOffice conversion timeout after {timeout_seconds} seconds", "ERROR")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False
+
+        out_txt = (stdout or b"").decode(errors="ignore")
+        err_txt = (stderr or b"").decode(errors="ignore")
+        if out_txt:
+            log_print(f"DEBUG: LibreOffice stdout: {out_txt[:500]}", "DEBUG")
+        if err_txt:
+            log_print(f"DEBUG: LibreOffice stderr: {err_txt[:500]}", "DEBUG")
+
+        if proc.returncode != 0:
+            log_print(f"ERROR: LibreOffice exited with code {proc.returncode}", "ERROR")
+            return False
+
+        produced_pdf = os.path.join(outdir, os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
+        if not os.path.exists(produced_pdf):
+            log_print("ERROR: LibreOffice did not produce expected PDF file", "ERROR")
+            return False
+
+        if os.path.abspath(produced_pdf) != os.path.abspath(pdf_path):
+            try:
+                if os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+                shutil.move(produced_pdf, pdf_path)
+            except Exception as e:
+                log_print(f"ERROR: Failed to move produced PDF to target path: {e}", "ERROR")
+                return False
+
+        return True
+    except FileNotFoundError:
+        log_print("ERROR: LibreOffice executable not found when starting process", "ERROR")
+        return False
+    except Exception as e:
+        log_print(f"ERROR: LibreOffice conversion failed: {e}", "ERROR")
+        return False
+
+
 async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any]:
     """Memproses satu request konversi"""
     # Validasi nama file
@@ -325,14 +489,29 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     #     raise Exception("File DOCX corrupt atau tidak valid. Silakan periksa file dan coba lagi.")
     log_print("INFO: Skipping DOCX validation (temporary)")
 
-    # Konversi DOCX -> PDF dengan timeout protection
-    log_print("INFO: Starting DOCX to PDF conversion with timeout protection (90s)...")
-    conversion_timeout = 90  # 90 detik timeout
-    
-    conversion_success = await asyncio.get_event_loop().run_in_executor(
-        None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
-    )
-    
+    # Konversi DOCX -> PDF: coba LibreOffice dulu, jika gagal baru fallback ke MS Word (docx2pdf) pada Windows/macOS
+    conversion_timeout = int(os.getenv("CONVERSION_TIMEOUT", "90"))
+    log_print(f"INFO: Starting DOCX to PDF conversion (timeout {conversion_timeout}s). First try LibreOffice...")
+
+    loop = asyncio.get_event_loop()
+    lo_success = await loop.run_in_executor(None, convert_with_libreoffice, path_docx, path_pdf, conversion_timeout)
+
+    conversion_success = lo_success
+    fallback_used = False
+
+    if not lo_success:
+        # Jika gagal dan platform mendukung MS Word/Automator, coba fallback docx2pdf
+        platform_supported = sys.platform in ("win32", "darwin")
+        if platform_supported:
+            log_print("INFO: LibreOffice conversion failed or unavailable. Trying fallback via MS Word/Automator (docx2pdf)...")
+            conversion_success = await loop.run_in_executor(
+                None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
+            )
+            fallback_used = True
+        else:
+            log_print("ERROR: LibreOffice conversion failed and MS Word fallback is not available on this platform.", "ERROR")
+            conversion_success = False
+
     if not conversion_success:
         # Cleanup files jika konversi gagal
         try:
@@ -340,13 +519,17 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
                 os.remove(path_docx)
             if os.path.exists(path_pdf):
                 os.remove(path_pdf)
-        except:
+        except Exception:
             pass
-        raise Exception(
-            f"Gagal konversi DOCX ke PDF. Kemungkinan file corrupt, timeout, atau "
-            f"Microsoft Word tidak tersedia. Pastikan menjalankan di Windows/Mac "
-            f"dengan Microsoft Word terpasang."
-        )
+        if fallback_used:
+            raise Exception(
+                "Gagal konversi via LibreOffice dan fallback MS Word/Automator. "
+                "Periksa apakah file valid, tidak corrupt, dan MS Word/Automator tersedia."
+            )
+        else:
+            raise Exception(
+                "Gagal konversi via LibreOffice. Pastikan LibreOffice terpasang dan bisa dijalankan headless."
+            )
 
     if not os.path.exists(path_pdf):
         raise Exception("File PDF tidak ditemukan setelah konversi")

@@ -1,5 +1,5 @@
-# NOTE: docx2pdf requires Microsoft Word and will NOT work inside this Linux-based container.
-# This container is suitable for API development/testing only; the /convert endpoint will fail here.
+# NOTE: docx2pdf (MS Word) will NOT work inside this Linux container. However, we enable
+# LibreOffice-based conversion so /convert can succeed via LibreOffice headless.
 
 FROM python:3.11-slim
 
@@ -8,9 +8,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps (optional: add build tools if needed)
+# System deps including LibreOffice and common fonts for better PDF fidelity
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    libreoffice \
+    libreoffice-writer \
+    fonts-dejavu-core \
+    fonts-liberation \
+    fonts-noto \
+    ghostscript \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
