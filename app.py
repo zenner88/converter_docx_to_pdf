@@ -13,7 +13,7 @@ import zipfile
 import signal
 import sys
 import subprocess
-import psutil
+# import psutil  # Optional: uncomment if psutil is installed
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
@@ -422,39 +422,64 @@ def check_conversion_engines() -> Dict[str, bool]:
 def cleanup_hanging_processes():
     """Clean up any hanging LibreOffice or Word processes."""
     try:
-        cleaned = 0
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                name = proc.info['name'].lower()
-                cmdline = ' '.join(proc.info['cmdline'] or []).lower()
-                
-                # Check for LibreOffice processes
-                if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
-                    log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-                    cleaned += 1
+        # Try to use psutil if available, otherwise use basic subprocess approach
+        try:
+            import psutil
+            cleaned = 0
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    name = proc.info['name'].lower()
+                    cmdline = ' '.join(proc.info['cmdline'] or []).lower()
                     
-                # Check for Word processes (Windows)
-                elif sys.platform == "win32" and 'winword' in name:
-                    # Only kill if it's been running for a while without user interaction
-                    try:
-                        create_time = proc.create_time()
-                        if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
-                            log_print(f"INFO: Terminating old Word process PID {proc.info['pid']}")
-                            proc.terminate()
-                            cleaned += 1
-                    except Exception:
-                        pass
+                    # Check for LibreOffice processes
+                    if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
+                        log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                        cleaned += 1
                         
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
+                    # Check for Word processes (Windows)
+                    elif sys.platform == "win32" and 'winword' in name:
+                        # Only kill if it's been running for a while without user interaction
+                        try:
+                            create_time = proc.create_time()
+                            if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
+                                log_print(f"INFO: Terminating old Word process PID {proc.info['pid']}")
+                                proc.terminate()
+                                cleaned += 1
+                        except Exception:
+                            pass
+                            
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+                    
+            if cleaned > 0:
+                log_print(f"INFO: Cleaned up {cleaned} hanging processes")
                 
-        if cleaned > 0:
-            log_print(f"INFO: Cleaned up {cleaned} hanging processes")
+        except ImportError:
+            # Fallback: Basic process cleanup without psutil
+            log_print("INFO: psutil not available, using basic process cleanup")
+            if sys.platform == "win32":
+                try:
+                    # Kill hanging soffice processes on Windows
+                    subprocess.run(["taskkill", "/f", "/im", "soffice.exe"], 
+                                 capture_output=True, timeout=10)
+                    subprocess.run(["taskkill", "/f", "/im", "soffice.bin"], 
+                                 capture_output=True, timeout=10)
+                    log_print("INFO: Attempted basic LibreOffice process cleanup")
+                except Exception as e:
+                    log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
+            else:
+                try:
+                    # Kill hanging soffice processes on Linux/macOS
+                    subprocess.run(["pkill", "-f", "soffice.*--headless"], 
+                                 capture_output=True, timeout=10)
+                    log_print("INFO: Attempted basic LibreOffice process cleanup")
+                except Exception as e:
+                    log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
             
     except Exception as e:
         log_print(f"WARNING: Process cleanup failed: {e}", "WARNING")
