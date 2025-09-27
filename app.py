@@ -13,6 +13,7 @@ import zipfile
 import signal
 import sys
 import subprocess
+import psutil
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
@@ -107,7 +108,7 @@ enable_queue_status_log_suppression()
 conversion_queue = asyncio.Queue()
 queue_status: Dict[str, Dict[str, Any]] = {}
 queue_workers_running = 0
-MAX_CONCURRENT_WORKERS = 5  # Reduced from 10 to avoid COM threading issues
+MAX_CONCURRENT_WORKERS = 3  # Further reduced to minimize COM/process conflicts
 
 @dataclass
 class ConversionRequest:
@@ -157,6 +158,12 @@ async def process_conversion_queue(worker_id: int):
                 queue_status[request.request_id]["completed_at"] = datetime.now()
                 
                 log_print(f"ERROR: Worker {worker_id} failed conversion request {request.request_id}: {e}", "ERROR")
+                
+                # Clean up hanging processes after failures
+                try:
+                    cleanup_hanging_processes()
+                except Exception as cleanup_error:
+                    log_print(f"WARNING: Process cleanup after error failed: {cleanup_error}", "WARNING")
             
             # Tandai task selesai di queue
             conversion_queue.task_done()
@@ -240,16 +247,19 @@ def validate_docx_content(file_content: bytes) -> tuple[bool, str]:
 
 
 def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
-    """Konversi DOCX ke PDF dengan timeout protection (docx2pdf)."""
+    """Konversi DOCX ke PDF dengan timeout protection (docx2pdf) dengan improved COM handling."""
     def conversion_task():
+        com_initialized = False
         try:
-            # Initialize COM untuk thread ini (Windows only)
+            # Initialize COM untuk thread ini (Windows only) dengan apartment threading
             import sys
             if sys.platform == "win32":
                 try:
                     import pythoncom
-                    pythoncom.CoInitialize()
-                    log_print("DEBUG: COM initialized for conversion thread", "DEBUG")
+                    # Use COINIT_APARTMENTTHREADED untuk better stability
+                    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+                    com_initialized = True
+                    log_print("DEBUG: COM initialized with apartment threading", "DEBUG")
                 except ImportError:
                     log_print("WARNING: pythoncom not available, COM may not work properly", "WARNING")
                 except Exception as e:
@@ -259,25 +269,32 @@ def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 6
             convert(docx_path, pdf_path)
             
             # Cleanup COM
-            if sys.platform == "win32":
+            if sys.platform == "win32" and com_initialized:
                 try:
                     import pythoncom
                     pythoncom.CoUninitialize()
                     log_print("DEBUG: COM uninitialized for conversion thread", "DEBUG")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_print(f"WARNING: COM cleanup failed: {e}", "WARNING")
             
             return True
         except Exception as e:
-            log_print(f"ERROR: Conversion failed: {e}", "ERROR")
+            error_msg = str(e)
+            log_print(f"ERROR: Conversion failed: {error_msg}", "ERROR")
+            
+            # Check for specific COM errors
+            if "-2147023170" in error_msg or "remote procedure call failed" in error_msg.lower():
+                log_print("ERROR: COM/RPC failure detected - MS Word may be unavailable or hanging", "ERROR")
+            elif "0x800706be" in error_msg:
+                log_print("ERROR: RPC server unavailable - MS Word service may be down", "ERROR")
+            
             # Cleanup COM jika error
-            try:
-                import sys as _sys
-                if _sys.platform == "win32":
-                    import pythoncom as _pythoncom
-                    _pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            if sys.platform == "win32" and com_initialized:
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
             return False
     
     # Gunakan ThreadPoolExecutor dengan timeout
@@ -287,7 +304,7 @@ def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 6
             result = future.result(timeout=timeout_seconds)
             return result
         except FutureTimeoutError:
-            log_print(f"ERROR: Conversion timeout after {timeout_seconds} seconds", "ERROR")
+            log_print(f"ERROR: Conversion timeout after {timeout_seconds} seconds - likely MS Word hang", "ERROR")
             # Coba terminate proses yang hang
             try:
                 future.cancel()
@@ -352,9 +369,100 @@ def _find_soffice_executable() -> Optional[str]:
     return None
 
 
+def check_conversion_engines() -> Dict[str, bool]:
+    """Check availability of conversion engines."""
+    engines = {
+        "libreoffice": False,
+        "ms_word": False
+    }
+    
+    # Check LibreOffice
+    soffice = _find_soffice_executable()
+    if soffice:
+        try:
+            # Quick version check to verify LibreOffice is working
+            result = subprocess.run(
+                [soffice, "--version"],
+                capture_output=True,
+                timeout=10,
+                text=True
+            )
+            if result.returncode == 0:
+                engines["libreoffice"] = True
+                log_print(f"INFO: LibreOffice available: {result.stdout.strip()[:100]}")
+        except Exception as e:
+            log_print(f"WARNING: LibreOffice version check failed: {e}", "WARNING")
+    
+    # Check MS Word (Windows/macOS only)
+    if sys.platform in ("win32", "darwin"):
+        try:
+            if sys.platform == "win32":
+                import pythoncom
+                pythoncom.CoInitialize()
+                try:
+                    import win32com.client
+                    word = win32com.client.Dispatch("Word.Application")
+                    word.Visible = False
+                    word.Quit()
+                    engines["ms_word"] = True
+                    log_print("INFO: MS Word COM interface available")
+                except Exception:
+                    pass
+                finally:
+                    pythoncom.CoUninitialize()
+            else:  # macOS
+                # Check if MS Word is installed via Automator
+                engines["ms_word"] = True  # Assume available on macOS
+        except Exception as e:
+            log_print(f"DEBUG: MS Word check failed: {e}", "DEBUG")
+    
+    return engines
+
+
+def cleanup_hanging_processes():
+    """Clean up any hanging LibreOffice or Word processes."""
+    try:
+        cleaned = 0
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                name = proc.info['name'].lower()
+                cmdline = ' '.join(proc.info['cmdline'] or []).lower()
+                
+                # Check for LibreOffice processes
+                if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
+                    log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    cleaned += 1
+                    
+                # Check for Word processes (Windows)
+                elif sys.platform == "win32" and 'winword' in name:
+                    # Only kill if it's been running for a while without user interaction
+                    try:
+                        create_time = proc.create_time()
+                        if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
+                            log_print(f"INFO: Terminating old Word process PID {proc.info['pid']}")
+                            proc.terminate()
+                            cleaned += 1
+                    except Exception:
+                        pass
+                        
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+                
+        if cleaned > 0:
+            log_print(f"INFO: Cleaned up {cleaned} hanging processes")
+            
+    except Exception as e:
+        log_print(f"WARNING: Process cleanup failed: {e}", "WARNING")
+
+
 def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
     """
-    Konversi DOCX ke PDF menggunakan LibreOffice (headless) dengan timeout.
+    Konversi DOCX ke PDF menggunakan LibreOffice (headless) dengan improved timeout dan error handling.
     Menghindari hang dengan menjalankan proses dan mematikan jika timeout.
     """
     soffice = _find_soffice_executable()
@@ -363,6 +471,9 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
         return False
 
     outdir = os.path.dirname(pdf_path) or os.getcwd()
+    
+    # Ensure output directory exists
+    os.makedirs(outdir, exist_ok=True)
 
     cmd = [
         soffice,
@@ -371,6 +482,7 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
         "--nolockcheck",
         "--nodefault",
         "--nofirststartwizard",
+        "--invisible",  # Additional flag for better headless operation
         "--convert-to",
         "pdf:writer_pdf_Export",
         "--outdir",
@@ -379,65 +491,117 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
     ]
 
     log_print(f"INFO: Trying conversion via LibreOffice: {' '.join(cmd)}")
+    proc = None
     try:
-        # Windows: gunakan creationflags; POSIX: preexec_fn opsional
-        kwargs = {}
+        # Enhanced process creation with better isolation
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "stdin": subprocess.DEVNULL,  # Prevent hanging on input
+        }
+        
         if sys.platform == "win32":
             try:
-                kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                # Use CREATE_NEW_PROCESS_GROUP for better process isolation
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
             except Exception:
-                pass
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
+            # POSIX: create new session for better process isolation
             kwargs["preexec_fn"] = os.setsid if hasattr(os, "setsid") else None
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **kwargs,
-        )
+        proc = subprocess.Popen(cmd, **kwargs)
+        
         try:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             log_print(f"ERROR: LibreOffice conversion timeout after {timeout_seconds} seconds", "ERROR")
             try:
-                proc.kill()
-            except Exception:
-                pass
+                # Try graceful termination first
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if terminate doesn't work
+                    proc.kill()
+                    proc.wait()
+            except Exception as e:
+                log_print(f"WARNING: Failed to terminate LibreOffice process: {e}", "WARNING")
             return False
 
         out_txt = (stdout or b"").decode(errors="ignore")
         err_txt = (stderr or b"").decode(errors="ignore")
-        if out_txt:
+        
+        if out_txt.strip():
             log_print(f"DEBUG: LibreOffice stdout: {out_txt[:500]}", "DEBUG")
-        if err_txt:
+        if err_txt.strip():
             log_print(f"DEBUG: LibreOffice stderr: {err_txt[:500]}", "DEBUG")
 
         if proc.returncode != 0:
             log_print(f"ERROR: LibreOffice exited with code {proc.returncode}", "ERROR")
+            if err_txt:
+                # Log specific error patterns
+                if "Error:" in err_txt or "Exception:" in err_txt:
+                    log_print(f"ERROR: LibreOffice specific error: {err_txt[:200]}", "ERROR")
+                if "locked" in err_txt.lower():
+                    log_print("ERROR: LibreOffice file lock detected - may need cleanup", "ERROR")
             return False
 
-        produced_pdf = os.path.join(outdir, os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
+        # Check if PDF was produced
+        expected_name = os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
+        produced_pdf = os.path.join(outdir, expected_name)
+        
         if not os.path.exists(produced_pdf):
-            log_print("ERROR: LibreOffice did not produce expected PDF file", "ERROR")
+            log_print(f"ERROR: LibreOffice did not produce expected PDF file: {produced_pdf}", "ERROR")
+            # List files in output directory for debugging
+            try:
+                files_in_dir = os.listdir(outdir)
+                log_print(f"DEBUG: Files in output directory: {files_in_dir}", "DEBUG")
+            except Exception:
+                pass
             return False
 
+        # Move to target path if different
         if os.path.abspath(produced_pdf) != os.path.abspath(pdf_path):
             try:
                 if os.path.exists(pdf_path):
                     os.remove(pdf_path)
                 shutil.move(produced_pdf, pdf_path)
+                log_print(f"INFO: Moved PDF from {produced_pdf} to {pdf_path}")
             except Exception as e:
                 log_print(f"ERROR: Failed to move produced PDF to target path: {e}", "ERROR")
                 return False
 
+        # Verify final PDF exists and has reasonable size
+        if not os.path.exists(pdf_path):
+            log_print(f"ERROR: Final PDF not found at {pdf_path}", "ERROR")
+            return False
+            
+        pdf_size = os.path.getsize(pdf_path)
+        if pdf_size < 100:  # PDF should be at least 100 bytes
+            log_print(f"ERROR: Generated PDF is too small ({pdf_size} bytes) - likely corrupt", "ERROR")
+            return False
+            
+        log_print(f"INFO: LibreOffice conversion successful - PDF size: {pdf_size} bytes")
         return True
+        
     except FileNotFoundError:
         log_print("ERROR: LibreOffice executable not found when starting process", "ERROR")
         return False
     except Exception as e:
         log_print(f"ERROR: LibreOffice conversion failed: {e}", "ERROR")
         return False
+    finally:
+        # Ensure process is cleaned up
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any]:
@@ -489,28 +653,46 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     #     raise Exception("File DOCX corrupt atau tidak valid. Silakan periksa file dan coba lagi.")
     log_print("INFO: Skipping DOCX validation (temporary)")
 
+    # Check engine availability first
+    engines = check_conversion_engines()
+    log_print(f"INFO: Available conversion engines: {engines}")
+    
     # Konversi DOCX -> PDF: coba LibreOffice dulu, jika gagal baru fallback ke MS Word (docx2pdf) pada Windows/macOS
     conversion_timeout = int(os.getenv("CONVERSION_TIMEOUT", "90"))
     log_print(f"INFO: Starting DOCX to PDF conversion (timeout {conversion_timeout}s). First try LibreOffice...")
 
     loop = asyncio.get_event_loop()
-    lo_success = await loop.run_in_executor(None, convert_with_libreoffice, path_docx, path_pdf, conversion_timeout)
-
-    conversion_success = lo_success
+    conversion_success = False
     fallback_used = False
+    
+    # Try LibreOffice first if available
+    if engines["libreoffice"]:
+        lo_success = await loop.run_in_executor(None, convert_with_libreoffice, path_docx, path_pdf, conversion_timeout)
+        conversion_success = lo_success
+        
+        if lo_success:
+            log_print("INFO: LibreOffice conversion successful")
+        else:
+            log_print("WARNING: LibreOffice conversion failed, will try fallback", "WARNING")
+    else:
+        log_print("WARNING: LibreOffice not available, skipping to fallback", "WARNING")
 
-    if not lo_success:
-        # Jika gagal dan platform mendukung MS Word/Automator, coba fallback docx2pdf
-        platform_supported = sys.platform in ("win32", "darwin")
-        if platform_supported:
-            log_print("INFO: LibreOffice conversion failed or unavailable. Trying fallback via MS Word/Automator (docx2pdf)...")
+    # Try MS Word fallback if LibreOffice failed and MS Word is available
+    if not conversion_success and engines["ms_word"]:
+        log_print("INFO: Trying fallback via MS Word/Automator (docx2pdf)...")
+        try:
             conversion_success = await loop.run_in_executor(
                 None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
             )
             fallback_used = True
-        else:
-            log_print("ERROR: LibreOffice conversion failed and MS Word fallback is not available on this platform.", "ERROR")
-            conversion_success = False
+            if conversion_success:
+                log_print("INFO: MS Word fallback conversion successful")
+            else:
+                log_print("ERROR: MS Word fallback conversion failed", "ERROR")
+        except Exception as e:
+            log_print(f"ERROR: MS Word fallback failed with exception: {e}", "ERROR")
+    elif not conversion_success:
+        log_print("ERROR: No conversion engines available or all failed", "ERROR")
 
     if not conversion_success:
         # Cleanup files jika konversi gagal
@@ -521,15 +703,29 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
                 os.remove(path_pdf)
         except Exception:
             pass
-        if fallback_used:
-            raise Exception(
-                "Gagal konversi via LibreOffice dan fallback MS Word/Automator. "
-                "Periksa apakah file valid, tidak corrupt, dan MS Word/Automator tersedia."
-            )
+        # Provide more specific error messages based on what was tried
+        error_parts = []
+        if engines["libreoffice"]:
+            error_parts.append("LibreOffice conversion failed")
         else:
-            raise Exception(
-                "Gagal konversi via LibreOffice. Pastikan LibreOffice terpasang dan bisa dijalankan headless."
-            )
+            error_parts.append("LibreOffice not available")
+            
+        if engines["ms_word"]:
+            if fallback_used:
+                error_parts.append("MS Word fallback also failed")
+            else:
+                error_parts.append("MS Word fallback not attempted")
+        else:
+            error_parts.append("MS Word not available")
+            
+        error_msg = f"Conversion failed: {', '.join(error_parts)}. "
+        
+        if not any(engines.values()):
+            error_msg += "No conversion engines are available. Please install LibreOffice or MS Word."
+        else:
+            error_msg += "Please check if the DOCX file is valid and not corrupted."
+            
+        raise Exception(error_msg)
 
     if not os.path.exists(path_pdf):
         raise Exception("File PDF tidak ditemukan setelah konversi")
@@ -646,7 +842,23 @@ async def startup_event():
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    """Enhanced health check with conversion engine status."""
+    try:
+        engines = check_conversion_engines()
+        return {
+            "status": "ok",
+            "conversion_engines": engines,
+            "workers_running": queue_workers_running,
+            "max_workers": MAX_CONCURRENT_WORKERS,
+            "queue_size": conversion_queue.qsize()
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "workers_running": queue_workers_running,
+            "max_workers": MAX_CONCURRENT_WORKERS
+        }
 
 
 @app.get("/queue/status")
