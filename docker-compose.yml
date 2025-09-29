@@ -1,16 +1,60 @@
-version: "3.9"
+version: "3.8"
 
 services:
-  api:
+  gotenberg:
+    image: gotenberg/gotenberg:7
+    container_name: gotenberg
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  converter:
     build: .
-    container_name: pdef-generator-api
+    container_name: docx-pdf-converter
+    restart: unless-stopped
     ports:
       - "80:80"
-    volumes:
-      - ./:/app
     environment:
+      - USE_GOTENBERG=true
+      - GOTENBERG_URL=http://gotenberg:3000
+      - CONVERSION_TIMEOUT=90
+      - MAX_CONCURRENT_WORKERS=10
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
+    volumes:
+      - ./document:/app/document
+      - ./logs:/app/logs
+    depends_on:
+      gotenberg:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: Nginx reverse proxy for production
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
     restart: unless-stopped
-    # IMPORTANT: docx2pdf requires Microsoft Word and will not work inside this Linux container.
-    # The /convert endpoint will fail when running in Docker.
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - converter
+    profiles:
+      - production
