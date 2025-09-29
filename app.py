@@ -13,7 +13,12 @@ import zipfile
 import signal
 import sys
 import subprocess
-import psutil  # For process monitoring and cleanup
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
@@ -108,7 +113,7 @@ enable_queue_status_log_suppression()
 conversion_queue = asyncio.Queue()
 queue_status: Dict[str, Dict[str, Any]] = {}
 queue_workers_running = 0
-MAX_CONCURRENT_WORKERS = 3  # Further reduced to minimize COM/process conflicts
+MAX_CONCURRENT_WORKERS = 10  # Increased workers for better throughput
 
 @dataclass
 class ConversionRequest:
@@ -440,65 +445,74 @@ def check_conversion_engines() -> Dict[str, bool]:
 
 
 def cleanup_hanging_processes():
-    """Clean up any hanging LibreOffice or Word processes using psutil."""
-    try:
-        cleaned = 0
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                name = proc.info['name'].lower()
-                cmdline = ' '.join(proc.info['cmdline'] or []).lower()
-                
-                # Check for LibreOffice processes
-                if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
-                    log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-                    cleaned += 1
+    """Clean up any hanging LibreOffice or Word processes."""
+    if PSUTIL_AVAILABLE:
+        try:
+            cleaned = 0
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    name = proc.info['name'].lower()
+                    cmdline = ' '.join(proc.info['cmdline'] or []).lower()
                     
-                # Check for Word processes (Windows)
-                elif sys.platform == "win32" and 'winword' in name:
-                    # Only kill if it's been running for a while without user interaction
-                    try:
-                        create_time = proc.create_time()
-                        if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
-                            log_print(f"INFO: Terminating old Word process PID {proc.info['pid']}")
-                            proc.terminate()
-                            cleaned += 1
-                    except Exception:
-                        pass
+                    # Check for LibreOffice processes
+                    if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
+                        log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                        cleaned += 1
                         
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
+                    # Check for Word processes (Windows)
+                    elif sys.platform == "win32" and 'winword' in name:
+                        # Only kill if it's been running for a while without user interaction
+                        try:
+                            create_time = proc.create_time()
+                            if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
+                                log_print(f"INFO: Terminating old Word process PID {proc.info['pid']}")
+                                proc.terminate()
+                                cleaned += 1
+                        except Exception:
+                            pass
+                            
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+                    
+            if cleaned > 0:
+                log_print(f"INFO: Cleaned up {cleaned} hanging processes with psutil")
+            else:
+                log_print("INFO: No hanging processes found to cleanup")
+            return
                 
-        if cleaned > 0:
-            log_print(f"INFO: Cleaned up {cleaned} hanging processes with psutil")
-        else:
-            log_print("INFO: No hanging processes found to cleanup")
+        except Exception as e:
+            log_print(f"WARNING: psutil process cleanup failed: {e}, trying fallback", "WARNING")
+    
+    # Fallback: Basic process cleanup without psutil
+    log_print("INFO: Using basic process cleanup (psutil not available)")
+    if sys.platform == "win32":
+        try:
+            # Kill hanging soffice processes on Windows
+            result1 = subprocess.run(["taskkill", "/f", "/im", "soffice.exe"], 
+                         capture_output=True, timeout=10)
+            result2 = subprocess.run(["taskkill", "/f", "/im", "soffice.bin"], 
+                         capture_output=True, timeout=10)
+            log_print("INFO: Attempted basic LibreOffice process cleanup")
             
-    except Exception as e:
-        log_print(f"WARNING: psutil process cleanup failed: {e}, trying fallback", "WARNING")
-        # Fallback: Basic process cleanup without psutil
-        if sys.platform == "win32":
-            try:
-                # Kill hanging soffice processes on Windows
-                subprocess.run(["taskkill", "/f", "/im", "soffice.exe"], 
-                             capture_output=True, timeout=10)
-                subprocess.run(["taskkill", "/f", "/im", "soffice.bin"], 
-                             capture_output=True, timeout=10)
-                log_print("INFO: Attempted basic LibreOffice process cleanup")
-            except Exception as e:
-                log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
-        else:
-            try:
-                # Kill hanging soffice processes on Linux/macOS
-                subprocess.run(["pkill", "-f", "soffice.*--headless"], 
-                             capture_output=True, timeout=10)
-                log_print("INFO: Attempted basic LibreOffice process cleanup")
-            except Exception as e:
-                log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
+            # Log results for debugging
+            if result1.returncode == 0 or result2.returncode == 0:
+                log_print("INFO: Successfully killed some LibreOffice processes")
+            
+        except Exception as e:
+            log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
+    else:
+        try:
+            # Kill hanging soffice processes on Linux/macOS
+            subprocess.run(["pkill", "-f", "soffice.*--headless"], 
+                         capture_output=True, timeout=10)
+            log_print("INFO: Attempted basic LibreOffice process cleanup")
+        except Exception as e:
+            log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
 
 
 def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
@@ -1009,28 +1023,30 @@ async def convert_docx_to_pdf(
         created_at=datetime.now()
     )
     
-    # SYNCHRONOUS: Proses langsung tanpa queue
-    log_print(f"INFO: Processing conversion request {request_id} synchronously for {nomor_urut}")
+    # Tambahkan ke queue status tracking
+    queue_status[request_id] = {
+        "status": "queued",
+        "nomor_urut": nomor_urut,
+        "filename": filename,
+        "target_url": target_url,
+        "endpoint_type": "convert",
+        "created_at": conversion_request.created_at
+    }
     
-    try:
-        result = await process_single_conversion(conversion_request)
-        log_print(f"INFO: Synchronous conversion completed for {nomor_urut}")
-        
-        return JSONResponse(
-            content={
-                "status": "completed",
-                "request_id": request_id,
-                "nomor_urut": nomor_urut,
-                "message": "Konversi berhasil diselesaikan",
-                "result": result
-            }
-        )
-    except Exception as e:
-        log_print(f"ERROR: Synchronous conversion failed for {nomor_urut}: {e}", "ERROR")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Konversi gagal: {str(e)}"
-        )
+    # Tambahkan ke queue
+    await conversion_queue.put(conversion_request)
+    
+    log_print(f"INFO: Added conversion request {request_id} to queue for {nomor_urut}")
+    
+    return JSONResponse(
+        content={
+            "status": "queued",
+            "request_id": request_id,
+            "nomor_urut": nomor_urut,
+            "queue_position": conversion_queue.qsize(),
+            "message": "Request telah ditambahkan ke antrian. Gunakan /queue/status untuk melihat progress."
+        }
+    )
 
 
 @app.post("/convertDua")
@@ -1072,25 +1088,27 @@ async def convert_docx_to_pdf_dua(
         created_at=datetime.now()
     )
     
-    # SYNCHRONOUS: Proses langsung tanpa queue
-    log_print(f"INFO: Processing conversion request {request_id} synchronously for {nomor_urut}")
+    # Tambahkan ke queue status tracking
+    queue_status[request_id] = {
+        "status": "queued",
+        "nomor_urut": nomor_urut,
+        "filename": filename,
+        "target_url": target_url,
+        "endpoint_type": "convertDua",
+        "created_at": conversion_request.created_at
+    }
     
-    try:
-        result = await process_single_conversion(conversion_request)
-        log_print(f"INFO: Synchronous conversion completed for {nomor_urut}")
-        
-        return JSONResponse(
-            content={
-                "status": "completed",
-                "request_id": request_id,
-                "nomor_urut": nomor_urut,
-                "message": "Konversi berhasil diselesaikan",
-                "result": result
-            }
-        )
-    except Exception as e:
-        log_print(f"ERROR: Synchronous conversion failed for {nomor_urut}: {e}", "ERROR")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Konversi gagal: {str(e)}"
-        )
+    # Tambahkan ke queue
+    await conversion_queue.put(conversion_request)
+    
+    log_print(f"INFO: Added conversion request {request_id} to queue for {nomor_urut}")
+    
+    return JSONResponse(
+        content={
+            "status": "queued",
+            "request_id": request_id,
+            "nomor_urut": nomor_urut,
+            "queue_position": conversion_queue.qsize(),
+            "message": "Request telah ditambahkan ke antrian. Gunakan /queue/status untuk melihat progress."
+        }
+    )
