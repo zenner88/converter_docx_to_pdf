@@ -458,8 +458,8 @@ def cleanup_hanging_processes():
                     if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
                         try:
                             create_time = proc.create_time()
-                            # Only kill LibreOffice processes running longer than 10 minutes
-                            if (datetime.now().timestamp() - create_time) > 600:  # 10 minutes
+                            # Only kill LibreOffice processes running longer than 5 minutes
+                            if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
                                 log_print(f"INFO: Terminating long-running LibreOffice process PID {proc.info['pid']} (running for {int((datetime.now().timestamp() - create_time)/60)} minutes)")
                                 proc.terminate()
                                 try:
