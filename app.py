@@ -945,53 +945,81 @@ def health() -> dict:
     """Enhanced health check with conversion engine status."""
     try:
         engines = check_conversion_engines()
+        queue_size = conversion_queue.qsize()
+        
         return {
             "status": "ok",
+            "service": "DOCX to PDF Converter",
             "conversion_engines": engines,
             "workers_running": queue_workers_running,
             "max_workers": MAX_CONCURRENT_WORKERS,
-            "queue_size": conversion_queue.qsize()
+            "queue_size": queue_size,
+            "psutil_available": PSUTIL_AVAILABLE
         }
     except Exception as e:
+        log_print(f"ERROR: Health check failed: {e}", "ERROR")
         return {
             "status": "error",
+            "service": "DOCX to PDF Converter",
             "error": str(e),
             "workers_running": queue_workers_running,
-            "max_workers": MAX_CONCURRENT_WORKERS
+            "max_workers": MAX_CONCURRENT_WORKERS,
+            "queue_size": 0,
+            "psutil_available": PSUTIL_AVAILABLE
         }
 
 
 @app.get("/queue/status")
 def get_queue_status():
     """Endpoint untuk melihat status queue"""
-    queue_size = conversion_queue.qsize()
-    
-    # Hitung status berdasarkan kategori
-    status_counts = {"queued": 0, "processing": 0, "completed": 0, "error": 0}
-    recent_requests = []
-    
-    for req_id, status_info in queue_status.items():
-        status_counts[status_info["status"]] += 1
-        recent_requests.append({
-            "request_id": req_id,
-            "nomor_urut": status_info.get("nomor_urut", "unknown"),
-            "status": status_info["status"],
-            "created_at": status_info["created_at"].isoformat(),
-            "started_at": status_info.get("started_at").isoformat() if status_info.get("started_at") else None,
-            "completed_at": status_info.get("completed_at").isoformat() if status_info.get("completed_at") else None,
-            "error": status_info.get("error")
-        })
-    
-    # Urutkan berdasarkan waktu pembuatan (terbaru dulu)
-    recent_requests.sort(key=lambda x: x["created_at"], reverse=True)
-    
-    return {
-        "queue_size": queue_size,
-        "workers_running": queue_workers_running,
-        "max_concurrent_workers": MAX_CONCURRENT_WORKERS,
-        "status_counts": status_counts,
-        "recent_requests": recent_requests[:20]  # Tampilkan 20 request terakhir
-    }
+    try:
+        queue_size = conversion_queue.qsize()
+        
+        # Hitung status berdasarkan kategori
+        status_counts = {"queued": 0, "processing": 0, "completed": 0, "error": 0}
+        recent_requests = []
+        
+        for req_id, status_info in queue_status.items():
+            try:
+                status_counts[status_info["status"]] += 1
+                recent_requests.append({
+                    "request_id": req_id,
+                    "nomor_urut": status_info.get("nomor_urut", "unknown"),
+                    "status": status_info["status"],
+                    "created_at": status_info["created_at"].isoformat() if status_info.get("created_at") else None,
+                    "started_at": status_info.get("started_at").isoformat() if status_info.get("started_at") else None,
+                    "completed_at": status_info.get("completed_at").isoformat() if status_info.get("completed_at") else None,
+                    "error": status_info.get("error")
+                })
+            except Exception as e:
+                log_print(f"WARNING: Error processing queue status for {req_id}: {e}", "WARNING")
+                continue
+        
+        # Urutkan berdasarkan waktu pembuatan (terbaru dulu)
+        try:
+            recent_requests.sort(key=lambda x: x["created_at"] or "", reverse=True)
+        except Exception as e:
+            log_print(f"WARNING: Error sorting recent requests: {e}", "WARNING")
+        
+        return {
+            "status": "ok",
+            "queue_size": queue_size,
+            "workers_running": queue_workers_running,
+            "max_concurrent_workers": MAX_CONCURRENT_WORKERS,
+            "status_counts": status_counts,
+            "recent_requests": recent_requests[:20]  # Tampilkan 20 request terakhir
+        }
+    except Exception as e:
+        log_print(f"ERROR: Queue status endpoint failed: {e}", "ERROR")
+        return {
+            "status": "error",
+            "error": f"Failed to get queue status: {str(e)}",
+            "queue_size": 0,
+            "workers_running": queue_workers_running,
+            "max_concurrent_workers": MAX_CONCURRENT_WORKERS,
+            "status_counts": {"queued": 0, "processing": 0, "completed": 0, "error": 0},
+            "recent_requests": []
+        }
 
 
 @app.post("/convert")
