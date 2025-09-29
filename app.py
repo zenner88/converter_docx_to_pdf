@@ -520,13 +520,6 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
     # Ensure output directory exists
     os.makedirs(outdir, exist_ok=True)
 
-    # Use a unique user profile per conversion to avoid profile lock conflicts across workers
-    temp_profile_dir = None
-    try:
-        temp_profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
-    except Exception:
-        temp_profile_dir = None
-
     cmd = [
         soffice,
         "--headless",
@@ -535,16 +528,6 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
         "--nodefault",
         "--nofirststartwizard",
         "--invisible",  # Additional flag for better headless operation
-    ]
-
-    # If temp profile available, inject into environment arg
-    if temp_profile_dir:
-        # LibreOffice expects a file URL, forward slashes
-        profile_url = f"file:///{temp_profile_dir.replace('\\', '/')}"
-        cmd.append(f"--env:UserInstallation={profile_url}")
-
-    # Add conversion args at the end
-    cmd += [
         "--convert-to",
         "pdf:writer_pdf_Export",
         "--outdir",
@@ -664,12 +647,6 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
                     proc.kill()
                 except Exception:
                     pass
-        # Cleanup temporary LibreOffice profile directory
-        if temp_profile_dir:
-            try:
-                shutil.rmtree(temp_profile_dir, ignore_errors=True)
-            except Exception:
-                pass
 
 
 async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any]:
@@ -686,13 +663,29 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     path_docx = os.path.join(base_dir, f"{safe_name}.docx")
     path_pdf = os.path.join(base_dir, f"{safe_name}.pdf")
 
-    # Hapus file lama jika ada (DOCX dan PDF)
+    # Hapus file lama jika ada (DOCX dan PDF) dengan cleanup proses hanging
     try:
         if os.path.exists(path_docx):
+            # Cleanup hanging processes before removing file
+            cleanup_hanging_processes()
+            # Wait a bit for processes to terminate
+            import time
+            time.sleep(0.5)
             os.remove(path_docx)
             log_print(f"INFO: Removed existing DOCX file: {path_docx}")
     except Exception as e:
         log_print(f"WARNING: Failed to remove existing DOCX file: {e}", "WARNING")
+        # Force cleanup and try again
+        try:
+            cleanup_hanging_processes()
+            import time
+            time.sleep(1)
+            if os.path.exists(path_docx):
+                os.remove(path_docx)
+                log_print(f"INFO: Force removed DOCX file after cleanup: {path_docx}")
+        except Exception as e2:
+            log_print(f"ERROR: Could not remove DOCX file even after cleanup: {e2}", "ERROR")
+            raise Exception(f"Gagal menghapus file DOCX yang sedang digunakan: {e2}")
     
     try:
         if os.path.exists(path_pdf):
