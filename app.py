@@ -23,7 +23,15 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
-# from docx2pdf import convert  # Disabled to prevent MS Word issues
+# MS Word COM interface (safe implementation)
+try:
+    import win32com.client
+    import pythoncom
+    MSWORD_AVAILABLE = True
+except ImportError:
+    MSWORD_AVAILABLE = False
+    win32com = None
+    pythoncom = None
 import httpx
 
 # Setup logging untuk file
@@ -258,7 +266,71 @@ def validate_docx_content(file_content: bytes) -> tuple[bool, str]:
         return False, f"Error validasi awal: {e}"
 
 
-# MS Word conversion disabled to prevent system hang and resource issues
+def convert_with_msword_safe(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
+    """
+    Safe MS Word conversion without opening UI and with proper cleanup.
+    Uses COM interface with invisible Word application.
+    """
+    if not MSWORD_AVAILABLE:
+        log_print("WARNING: MS Word COM interface not available", "WARNING")
+        return False
+        
+    word_app = None
+    doc = None
+    
+    try:
+        log_print(f"INFO: Starting MS Word conversion (timeout {timeout_seconds}s)")
+        
+        # Initialize COM for this thread
+        pythoncom.CoInitialize()
+        
+        # Create Word application (invisible)
+        word_app = win32com.client.Dispatch("Word.Application")
+        word_app.Visible = False  # CRITICAL: Keep Word invisible
+        word_app.DisplayAlerts = 0  # Disable all alerts/dialogs
+        word_app.ScreenUpdating = False  # Disable screen updates
+        
+        # Open document (without showing)
+        doc = word_app.Documents.Open(docx_path, ReadOnly=True, Visible=False)
+        
+        # Export to PDF (17 = PDF format)
+        doc.ExportAsFixedFormat(
+            OutputFileName=pdf_path,
+            ExportFormat=17,  # PDF format
+            OpenAfterExport=False,  # Don't open PDF after export
+            OptimizeFor=0,  # Optimize for print
+            BitmapMissingFonts=True,
+            DocStructureTags=False,
+            CreateBookmarks=0,
+            UseDocumentPrintSettings=False
+        )
+        
+        log_print("INFO: MS Word conversion completed successfully")
+        return True
+        
+    except Exception as e:
+        log_print(f"ERROR: MS Word conversion failed: {e}", "ERROR")
+        return False
+        
+    finally:
+        # CRITICAL: Proper cleanup to prevent hanging
+        try:
+            if doc:
+                doc.Close(SaveChanges=False)
+                doc = None
+            if word_app:
+                word_app.Quit()
+                word_app = None
+        except Exception as e:
+            log_print(f"WARNING: MS Word cleanup error: {e}", "WARNING")
+        
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+# Legacy function kept for reference (disabled)
 def convert_with_timeout_DISABLED(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
     """Konversi DOCX ke PDF dengan timeout protection (docx2pdf) dengan improved COM handling."""
     def conversion_task():
@@ -426,28 +498,26 @@ def check_conversion_engines() -> Dict[str, bool]:
         except Exception as e:
             log_print(f"WARNING: LibreOffice version check failed: {e}", "WARNING")
     
-    # Check MS Word (Windows/macOS only)
-    if sys.platform in ("win32", "darwin"):
+    # Check MS Word (Windows only with safe COM interface)
+    if MSWORD_AVAILABLE and sys.platform == "win32":
         try:
-            if sys.platform == "win32":
-                import pythoncom
-                pythoncom.CoInitialize()
+            pythoncom.CoInitialize()
+            try:
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = 0
+                word.Quit()
+                engines["ms_word"] = True
+                log_print("INFO: MS Word COM interface available (safe mode)")
+            except Exception as e:
+                log_print(f"WARNING: MS Word COM test failed: {e}", "WARNING")
+            finally:
                 try:
-                    import win32com.client
-                    word = win32com.client.Dispatch("Word.Application")
-                    word.Visible = False
-                    word.Quit()
-                    engines["ms_word"] = True
-                    log_print("INFO: MS Word COM interface available")
+                    pythoncom.CoUninitialize()
                 except Exception:
                     pass
-                finally:
-                    pythoncom.CoUninitialize()
-            else:  # macOS
-                # Check if MS Word is installed via Automator
-                engines["ms_word"] = True  # Assume available on macOS
         except Exception as e:
-            log_print(f"DEBUG: MS Word check failed: {e}", "DEBUG")
+            log_print(f"WARNING: MS Word COM initialization failed: {e}", "WARNING")
     
     return engines
 
@@ -843,10 +913,26 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
             else:
                 log_print("WARNING: LibreOffice conversion failed, will try fallback", "WARNING")
 
-    # MS Word fallback disabled to prevent system hang and resource issues
-    if not conversion_success:
-        log_print("INFO: MS Word fallback disabled to prevent system hang and resource issues", "WARNING")
-        log_print("ERROR: Primary conversion failed and no fallback available", "ERROR")
+    # Try MS Word fallback if primary conversion failed and MS Word is available
+    if not conversion_success and engines["ms_word"]:
+        log_print("INFO: Trying safe MS Word fallback (invisible, no UI)...")
+        try:
+            # Use semaphore to limit concurrent MS Word processes
+            async with MS_WORD_SEMAPHORE:
+                loop = asyncio.get_event_loop()
+                conversion_success = await loop.run_in_executor(
+                    None, convert_with_msword_safe, path_docx, path_pdf, conversion_timeout
+                )
+                fallback_used = True
+                
+            if conversion_success:
+                log_print("INFO: MS Word safe fallback conversion successful")
+            else:
+                log_print("ERROR: MS Word safe fallback conversion failed", "ERROR")
+        except Exception as e:
+            log_print(f"ERROR: MS Word safe fallback failed with exception: {e}", "ERROR")
+    elif not conversion_success:
+        log_print("ERROR: Primary conversion failed and MS Word fallback not available", "ERROR")
 
     if not conversion_success:
         # Cleanup files jika konversi gagal
@@ -866,8 +952,13 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
         else:
             error_parts.append("Primary conversion engine not available")
             
-        # MS Word fallback disabled
-        error_parts.append("MS Word fallback disabled to prevent system issues")
+        if engines["ms_word"]:
+            if fallback_used:
+                error_parts.append("MS Word safe fallback also failed")
+            else:
+                error_parts.append("MS Word safe fallback not attempted")
+        else:
+            error_parts.append("MS Word not available")
             
         error_msg = f"Conversion failed: {', '.join(error_parts)}. "
         
