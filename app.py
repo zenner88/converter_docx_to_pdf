@@ -149,12 +149,33 @@ async def process_conversion_queue(worker_id: int):
                 # Proses konversi
                 result = await process_single_conversion(request)
                 
-                # Update status menjadi completed
-                queue_status[request.request_id]["status"] = "completed"
+                # Cek hasil upload untuk menentukan status final
+                upload_success = False
+                if result and result.get("target_status"):
+                    target_status = result["target_status"]
+                    target_response = result.get("target_response")
+                    
+                    # Upload sukses jika status 2xx dan ada upload_data di response
+                    if 200 <= target_status < 300:
+                        if isinstance(target_response, dict) and "upload_data" in target_response:
+                            upload_success = True
+                            log_print(f"INFO: Upload successful for request {request.request_id}")
+                        else:
+                            log_print(f"WARNING: Upload status 2xx but no upload_data in response for request {request.request_id}")
+                    else:
+                        log_print(f"WARNING: Upload failed with status {target_status} for request {request.request_id}")
+                
+                # Update status berdasarkan hasil upload
+                if upload_success:
+                    queue_status[request.request_id]["status"] = "completed"
+                    log_print(f"INFO: Worker {worker_id} completed conversion and upload for request {request.request_id}")
+                else:
+                    queue_status[request.request_id]["status"] = "upload_failed"
+                    log_print(f"WARNING: Worker {worker_id} conversion success but upload failed for request {request.request_id}")
+                
                 queue_status[request.request_id]["completed_at"] = datetime.now()
                 queue_status[request.request_id]["result"] = result
-                
-                log_print(f"INFO: Worker {worker_id} completed conversion request {request.request_id}")
+                queue_status[request.request_id]["upload_success"] = upload_success
                 
             except Exception as e:
                 # Update status menjadi error
@@ -976,7 +997,7 @@ def get_queue_status():
         queue_size = conversion_queue.qsize()
         
         # Hitung status berdasarkan kategori
-        status_counts = {"queued": 0, "processing": 0, "completed": 0, "error": 0}
+        status_counts = {"queued": 0, "processing": 0, "completed": 0, "upload_failed": 0, "error": 0}
         recent_requests = []
         
         for req_id, status_info in queue_status.items():
@@ -1017,7 +1038,7 @@ def get_queue_status():
             "queue_size": 0,
             "workers_running": queue_workers_running,
             "max_concurrent_workers": MAX_CONCURRENT_WORKERS,
-            "status_counts": {"queued": 0, "processing": 0, "completed": 0, "error": 0},
+            "status_counts": {"queued": 0, "processing": 0, "completed": 0, "upload_failed": 0, "error": 0},
             "recent_requests": []
         }
 
