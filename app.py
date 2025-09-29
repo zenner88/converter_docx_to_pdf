@@ -113,7 +113,7 @@ enable_queue_status_log_suppression()
 conversion_queue = asyncio.Queue()
 queue_status: Dict[str, Dict[str, Any]] = {}
 queue_workers_running = 0
-MAX_CONCURRENT_WORKERS = 10  # Increased workers for better throughput
+MAX_CONCURRENT_WORKERS = 15  # Increased workers for better throughput
 
 @dataclass
 class ConversionRequest:
