@@ -1,6 +1,6 @@
 fastapi==0.112.2
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
-docx2pdf==0.1.8
+# docx2pdf==0.1.8  # Disabled to prevent MS Word issues
 httpx==0.27.0
 psutil==5.9.8  # For advanced process monitoring and cleanup

@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
-from docx2pdf import convert
+# from docx2pdf import convert  # Disabled to prevent MS Word issues
 import httpx
 
 # Setup logging untuk file
@@ -258,7 +258,8 @@ def validate_docx_content(file_content: bytes) -> tuple[bool, str]:
         return False, f"Error validasi awal: {e}"
 
 
-def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
+# MS Word conversion disabled to prevent system hang and resource issues
+def convert_with_timeout_DISABLED(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
     """Konversi DOCX ke PDF dengan timeout protection (docx2pdf) dengan improved COM handling."""
     def conversion_task():
         com_initialized = False
@@ -842,26 +843,10 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
             else:
                 log_print("WARNING: LibreOffice conversion failed, will try fallback", "WARNING")
 
-    # Try MS Word fallback if primary conversion failed and MS Word is available
-    if not conversion_success and engines["ms_word"]:
-        log_print("INFO: Trying fallback via MS Word/Automator (docx2pdf)...")
-        try:
-            # Use semaphore to limit concurrent MS Word processes
-            async with MS_WORD_SEMAPHORE:
-                loop = asyncio.get_event_loop()
-                conversion_success = await loop.run_in_executor(
-                    None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
-                )
-                fallback_used = True
-                
-            if conversion_success:
-                log_print("INFO: MS Word fallback conversion successful")
-            else:
-                log_print("ERROR: MS Word fallback conversion failed", "ERROR")
-        except Exception as e:
-            log_print(f"ERROR: MS Word fallback failed with exception: {e}", "ERROR")
-    elif not conversion_success:
-        log_print("ERROR: No conversion engines available or all failed", "ERROR")
+    # MS Word fallback disabled to prevent system hang and resource issues
+    if not conversion_success:
+        log_print("INFO: MS Word fallback disabled to prevent system hang and resource issues", "WARNING")
+        log_print("ERROR: Primary conversion failed and no fallback available", "ERROR")
 
     if not conversion_success:
         # Cleanup files jika konversi gagal
@@ -881,18 +866,15 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
         else:
             error_parts.append("Primary conversion engine not available")
             
-        if engines["ms_word"]:
-            if fallback_used:
-                error_parts.append("MS Word fallback also failed")
-            else:
-                error_parts.append("MS Word fallback not attempted")
-        else:
-            error_parts.append("MS Word not available")
+        # MS Word fallback disabled
+        error_parts.append("MS Word fallback disabled to prevent system issues")
             
         error_msg = f"Conversion failed: {', '.join(error_parts)}. "
         
-        if not USE_GOTENBERG and not any(engines.values()):
-            error_msg += "No conversion engines are available. Please install LibreOffice or MS Word."
+        if USE_GOTENBERG:
+            error_msg += "Please ensure Gotenberg service is running and accessible."
+        elif not any(engines.values()):
+            error_msg += "Please install LibreOffice or setup Gotenberg service."
         else:
             error_msg += "Please check if the DOCX file is valid and not corrupted."
             
