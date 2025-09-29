@@ -266,7 +266,27 @@ def convert_with_timeout(docx_path: str, pdf_path: str, timeout_seconds: int = 6
                     log_print(f"WARNING: COM initialization failed: {e}", "WARNING")
             
             # Lakukan konversi (menggunakan Microsoft Word/Automator tergantung platform)
-            convert(docx_path, pdf_path)
+            # Note: On some Windows environments, docx2pdf works more reliably when the output
+            #      parameter is a DIRECTORY instead of a FILE path. We'll direct output to the
+            #      target directory and then move/rename to the desired file path if needed.
+            outdir = os.path.dirname(pdf_path) or os.getcwd()
+            os.makedirs(outdir, exist_ok=True)
+            convert(docx_path, outdir)
+
+            # Ensure produced file exists; if target filename differs, move it
+            produced_pdf = os.path.join(
+                outdir, os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
+            )
+            if not os.path.exists(produced_pdf):
+                raise Exception("docx2pdf did not produce expected PDF output")
+
+            if os.path.abspath(produced_pdf) != os.path.abspath(pdf_path):
+                try:
+                    if os.path.exists(pdf_path):
+                        os.remove(pdf_path)
+                    shutil.move(produced_pdf, pdf_path)
+                except Exception as move_err:
+                    raise Exception(f"Failed to move docx2pdf output to target path: {move_err}")
             
             # Cleanup COM
             if sys.platform == "win32" and com_initialized:
@@ -500,6 +520,13 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
     # Ensure output directory exists
     os.makedirs(outdir, exist_ok=True)
 
+    # Use a unique user profile per conversion to avoid profile lock conflicts across workers
+    temp_profile_dir = None
+    try:
+        temp_profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
+    except Exception:
+        temp_profile_dir = None
+
     cmd = [
         soffice,
         "--headless",
@@ -508,6 +535,16 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
         "--nodefault",
         "--nofirststartwizard",
         "--invisible",  # Additional flag for better headless operation
+    ]
+
+    # If temp profile available, inject into environment arg
+    if temp_profile_dir:
+        # LibreOffice expects a file URL, forward slashes
+        profile_url = f"file:///{temp_profile_dir.replace('\\', '/')}"
+        cmd.append(f"--env:UserInstallation={profile_url}")
+
+    # Add conversion args at the end
+    cmd += [
         "--convert-to",
         "pdf:writer_pdf_Export",
         "--outdir",
@@ -627,6 +664,12 @@ def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int
                     proc.kill()
                 except Exception:
                     pass
+        # Cleanup temporary LibreOffice profile directory
+        if temp_profile_dir:
+            try:
+                shutil.rmtree(temp_profile_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any]:
@@ -958,30 +1001,28 @@ async def convert_docx_to_pdf(
         created_at=datetime.now()
     )
     
-    # Tambahkan ke queue status tracking
-    queue_status[request_id] = {
-        "status": "queued",
-        "nomor_urut": nomor_urut,
-        "filename": filename,
-        "target_url": target_url,
-        "endpoint_type": "convert",
-        "created_at": conversion_request.created_at
-    }
+    # SYNCHRONOUS: Proses langsung tanpa queue
+    log_print(f"INFO: Processing conversion request {request_id} synchronously for {nomor_urut}")
     
-    # Tambahkan ke queue
-    await conversion_queue.put(conversion_request)
-    
-    log_print(f"INFO: Added conversion request {request_id} to queue for {nomor_urut}")
-    
-    return JSONResponse(
-        content={
-            "status": "queued",
-            "request_id": request_id,
-            "nomor_urut": nomor_urut,
-            "queue_position": conversion_queue.qsize(),
-            "message": "Request telah ditambahkan ke antrian. Gunakan /queue/status untuk melihat progress."
-        }
-    )
+    try:
+        result = await process_single_conversion(conversion_request)
+        log_print(f"INFO: Synchronous conversion completed for {nomor_urut}")
+        
+        return JSONResponse(
+            content={
+                "status": "completed",
+                "request_id": request_id,
+                "nomor_urut": nomor_urut,
+                "message": "Konversi berhasil diselesaikan",
+                "result": result
+            }
+        )
+    except Exception as e:
+        log_print(f"ERROR: Synchronous conversion failed for {nomor_urut}: {e}", "ERROR")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Konversi gagal: {str(e)}"
+        )
 
 
 @app.post("/convertDua")
@@ -1023,27 +1064,25 @@ async def convert_docx_to_pdf_dua(
         created_at=datetime.now()
     )
     
-    # Tambahkan ke queue status tracking
-    queue_status[request_id] = {
-        "status": "queued",
-        "nomor_urut": nomor_urut,
-        "filename": filename,
-        "target_url": target_url,
-        "endpoint_type": "convertDua",
-        "created_at": conversion_request.created_at
-    }
+    # SYNCHRONOUS: Proses langsung tanpa queue
+    log_print(f"INFO: Processing conversion request {request_id} synchronously for {nomor_urut}")
     
-    # Tambahkan ke queue
-    await conversion_queue.put(conversion_request)
-    
-    log_print(f"INFO: Added conversion request {request_id} to queue for {nomor_urut}")
-    
-    return JSONResponse(
-        content={
-            "status": "queued",
-            "request_id": request_id,
-            "nomor_urut": nomor_urut,
-            "queue_position": conversion_queue.qsize(),
-            "message": "Request telah ditambahkan ke antrian. Gunakan /queue/status untuk melihat progress."
-        }
-    )
+    try:
+        result = await process_single_conversion(conversion_request)
+        log_print(f"INFO: Synchronous conversion completed for {nomor_urut}")
+        
+        return JSONResponse(
+            content={
+                "status": "completed",
+                "request_id": request_id,
+                "nomor_urut": nomor_urut,
+                "message": "Konversi berhasil diselesaikan",
+                "result": result
+            }
+        )
+    except Exception as e:
+        log_print(f"ERROR: Synchronous conversion failed for {nomor_urut}: {e}", "ERROR")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Konversi gagal: {str(e)}"
+        )
