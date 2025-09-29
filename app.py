@@ -454,15 +454,25 @@ def cleanup_hanging_processes():
                     name = proc.info['name'].lower()
                     cmdline = ' '.join(proc.info['cmdline'] or []).lower()
                     
-                    # Check for LibreOffice processes
+                    # Check for LibreOffice processes - only kill if running too long
                     if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
-                        log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
-                        proc.terminate()
                         try:
-                            proc.wait(timeout=5)
-                        except psutil.TimeoutExpired:
-                            proc.kill()
-                        cleaned += 1
+                            create_time = proc.create_time()
+                            # Only kill LibreOffice processes running longer than 10 minutes
+                            if (datetime.now().timestamp() - create_time) > 600:  # 10 minutes
+                                log_print(f"INFO: Terminating long-running LibreOffice process PID {proc.info['pid']} (running for {int((datetime.now().timestamp() - create_time)/60)} minutes)")
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=5)
+                                except psutil.TimeoutExpired:
+                                    proc.kill()
+                                cleaned += 1
+                            else:
+                                # Don't kill recent LibreOffice processes - they might be actively converting
+                                log_print(f"DEBUG: Skipping recent LibreOffice process PID {proc.info['pid']} (running for {int((datetime.now().timestamp() - create_time)/60)} minutes)", "DEBUG")
+                        except Exception:
+                            # If we can't get create time, don't kill the process
+                            pass
                         
                     # Check for Word processes (Windows)
                     elif sys.platform == "win32" and 'winword' in name:
