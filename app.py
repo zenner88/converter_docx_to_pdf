@@ -13,7 +13,7 @@ import zipfile
 import signal
 import sys
 import subprocess
-# import psutil  # Optional: uncomment if psutil is installed
+import psutil  # For process monitoring and cleanup
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
@@ -440,69 +440,65 @@ def check_conversion_engines() -> Dict[str, bool]:
 
 
 def cleanup_hanging_processes():
-    """Clean up any hanging LibreOffice or Word processes."""
+    """Clean up any hanging LibreOffice or Word processes using psutil."""
     try:
-        # Try to use psutil if available, otherwise use basic subprocess approach
-        try:
-            import psutil
-            cleaned = 0
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    name = proc.info['name'].lower()
-                    cmdline = ' '.join(proc.info['cmdline'] or []).lower()
-                    
-                    # Check for LibreOffice processes
-                    if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
-                        log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=5)
-                        except psutil.TimeoutExpired:
-                            proc.kill()
-                        cleaned += 1
-                        
-                    # Check for Word processes (Windows)
-                    elif sys.platform == "win32" and 'winword' in name:
-                        # Only kill if it's been running for a while without user interaction
-                        try:
-                            create_time = proc.create_time()
-                            if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
-                                log_print(f"INFO: Terminating old Word process PID {proc.info['pid']}")
-                                proc.terminate()
-                                cleaned += 1
-                        except Exception:
-                            pass
-                            
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-                    
-            if cleaned > 0:
-                log_print(f"INFO: Cleaned up {cleaned} hanging processes")
+        cleaned = 0
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                name = proc.info['name'].lower()
+                cmdline = ' '.join(proc.info['cmdline'] or []).lower()
                 
-        except ImportError:
-            # Fallback: Basic process cleanup without psutil
-            log_print("INFO: psutil not available, using basic process cleanup")
-            if sys.platform == "win32":
-                try:
-                    # Kill hanging soffice processes on Windows
-                    subprocess.run(["taskkill", "/f", "/im", "soffice.exe"], 
-                                 capture_output=True, timeout=10)
-                    subprocess.run(["taskkill", "/f", "/im", "soffice.bin"], 
-                                 capture_output=True, timeout=10)
-                    log_print("INFO: Attempted basic LibreOffice process cleanup")
-                except Exception as e:
-                    log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
-            else:
-                try:
-                    # Kill hanging soffice processes on Linux/macOS
-                    subprocess.run(["pkill", "-f", "soffice.*--headless"], 
-                                 capture_output=True, timeout=10)
-                    log_print("INFO: Attempted basic LibreOffice process cleanup")
-                except Exception as e:
-                    log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
+                # Check for LibreOffice processes
+                if ('soffice' in name or 'libreoffice' in name) and '--headless' in cmdline:
+                    log_print(f"INFO: Terminating hanging LibreOffice process PID {proc.info['pid']}")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    cleaned += 1
+                    
+                # Check for Word processes (Windows)
+                elif sys.platform == "win32" and 'winword' in name:
+                    # Only kill if it's been running for a while without user interaction
+                    try:
+                        create_time = proc.create_time()
+                        if (datetime.now().timestamp() - create_time) > 300:  # 5 minutes
+                            log_print(f"INFO: Terminating old Word process PID {proc.info['pid']}")
+                            proc.terminate()
+                            cleaned += 1
+                    except Exception:
+                        pass
+                        
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+                
+        if cleaned > 0:
+            log_print(f"INFO: Cleaned up {cleaned} hanging processes with psutil")
+        else:
+            log_print("INFO: No hanging processes found to cleanup")
             
     except Exception as e:
-        log_print(f"WARNING: Process cleanup failed: {e}", "WARNING")
+        log_print(f"WARNING: psutil process cleanup failed: {e}, trying fallback", "WARNING")
+        # Fallback: Basic process cleanup without psutil
+        if sys.platform == "win32":
+            try:
+                # Kill hanging soffice processes on Windows
+                subprocess.run(["taskkill", "/f", "/im", "soffice.exe"], 
+                             capture_output=True, timeout=10)
+                subprocess.run(["taskkill", "/f", "/im", "soffice.bin"], 
+                             capture_output=True, timeout=10)
+                log_print("INFO: Attempted basic LibreOffice process cleanup")
+            except Exception as e:
+                log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
+        else:
+            try:
+                # Kill hanging soffice processes on Linux/macOS
+                subprocess.run(["pkill", "-f", "soffice.*--headless"], 
+                             capture_output=True, timeout=10)
+                log_print("INFO: Attempted basic LibreOffice process cleanup")
+            except Exception as e:
+                log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
 
 
 def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
@@ -685,7 +681,26 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
                 log_print(f"INFO: Force removed DOCX file after cleanup: {path_docx}")
         except Exception as e2:
             log_print(f"ERROR: Could not remove DOCX file even after cleanup: {e2}", "ERROR")
-            raise Exception(f"Gagal menghapus file DOCX yang sedang digunakan: {e2}")
+            # Last resort: try to find and kill specific processes using the file
+            try:
+                if sys.platform == "win32":
+                    # Use handle.exe if available, or force kill all soffice processes
+                    subprocess.run(["taskkill", "/f", "/im", "soffice.exe"], 
+                                 capture_output=True, timeout=5)
+                    subprocess.run(["taskkill", "/f", "/im", "soffice.bin"], 
+                                 capture_output=True, timeout=5)
+                    import time
+                    time.sleep(2)
+                    if os.path.exists(path_docx):
+                        os.remove(path_docx)
+                        log_print(f"INFO: Successfully removed DOCX after force kill: {path_docx}")
+                    else:
+                        log_print(f"WARNING: DOCX file no longer exists: {path_docx}", "WARNING")
+                else:
+                    raise Exception(f"Gagal menghapus file DOCX yang sedang digunakan: {e2}")
+            except Exception as e3:
+                log_print(f"ERROR: Final attempt to remove DOCX failed: {e3}", "ERROR")
+                raise Exception(f"Gagal menghapus file DOCX yang sedang digunakan: {e3}")
     
     try:
         if os.path.exists(path_pdf):
