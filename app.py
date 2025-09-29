@@ -115,6 +115,13 @@ queue_status: Dict[str, Dict[str, Any]] = {}
 queue_workers_running = 0
 MAX_CONCURRENT_WORKERS = 10  # Increased workers for better throughput
 
+# Gotenberg configuration
+GOTENBERG_URL = os.getenv("GOTENBERG_URL", "http://localhost:3000")
+USE_GOTENBERG = os.getenv("USE_GOTENBERG", "true").lower() == "true"
+
+# MS Word concurrency limiter (prevent COM conflicts)
+MS_WORD_SEMAPHORE = asyncio.Semaphore(2)  # Max 2 concurrent MS Word processes
+
 @dataclass
 class ConversionRequest:
     request_id: str
@@ -525,6 +532,50 @@ def cleanup_hanging_processes():
             log_print(f"DEBUG: Basic process cleanup failed: {e}", "DEBUG")
 
 
+async def convert_with_gotenberg(docx_content: bytes, timeout_seconds: int = 60) -> bytes:
+    """
+    Convert DOCX to PDF using Gotenberg service.
+    Returns PDF content as bytes.
+    """
+    try:
+        log_print(f"INFO: Starting Gotenberg conversion (timeout {timeout_seconds}s)")
+        
+        timeout_config = httpx.Timeout(timeout_seconds)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
+            # Prepare files for Gotenberg
+            files = {
+                "files": ("document.docx", docx_content, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            }
+            
+            # Make request to Gotenberg
+            gotenberg_endpoint = f"{GOTENBERG_URL}/forms/libreoffice/convert"
+            log_print(f"INFO: Calling Gotenberg at {gotenberg_endpoint}")
+            
+            response = await client.post(gotenberg_endpoint, files=files)
+            
+            if response.status_code == 200:
+                pdf_content = response.content
+                pdf_size = len(pdf_content)
+                
+                # Validate PDF size
+                if pdf_size < 100:
+                    raise Exception(f"Generated PDF is too small ({pdf_size} bytes) - likely corrupt")
+                
+                log_print(f"INFO: Gotenberg conversion successful - PDF size: {pdf_size} bytes")
+                return pdf_content
+            else:
+                error_text = response.text[:500] if response.text else "No error details"
+                raise Exception(f"Gotenberg returned status {response.status_code}: {error_text}")
+                
+    except httpx.TimeoutException:
+        raise Exception(f"Gotenberg conversion timeout after {timeout_seconds} seconds")
+    except httpx.ConnectError:
+        raise Exception("Cannot connect to Gotenberg service - is it running?")
+    except Exception as e:
+        log_print(f"ERROR: Gotenberg conversion failed: {e}", "ERROR")
+        raise
+
+
 def convert_with_libreoffice(docx_path: str, pdf_path: str, timeout_seconds: int = 60) -> bool:
     """
     Konversi DOCX ke PDF menggunakan LibreOffice (headless) dengan improved timeout dan error handling.
@@ -757,34 +808,52 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
     engines = check_conversion_engines()
     log_print(f"INFO: Available conversion engines: {engines}")
     
-    # Konversi DOCX -> PDF: coba LibreOffice dulu, jika gagal baru fallback ke MS Word (docx2pdf) pada Windows/macOS
+    # Konversi DOCX -> PDF: coba Gotenberg dulu, jika gagal baru fallback ke MS Word
     conversion_timeout = int(os.getenv("CONVERSION_TIMEOUT", "90"))
-    log_print(f"INFO: Starting DOCX to PDF conversion (timeout {conversion_timeout}s). First try LibreOffice...")
-
-    loop = asyncio.get_event_loop()
+    
     conversion_success = False
     fallback_used = False
+    pdf_content = None
     
-    # Try LibreOffice first if available
-    if engines["libreoffice"]:
-        lo_success = await loop.run_in_executor(None, convert_with_libreoffice, path_docx, path_pdf, conversion_timeout)
-        conversion_success = lo_success
-        
-        if lo_success:
-            log_print("INFO: LibreOffice conversion successful")
-        else:
-            log_print("WARNING: LibreOffice conversion failed, will try fallback", "WARNING")
+    # Try Gotenberg first if enabled
+    if USE_GOTENBERG:
+        log_print(f"INFO: Starting DOCX to PDF conversion (timeout {conversion_timeout}s). First try Gotenberg...")
+        try:
+            pdf_content = await convert_with_gotenberg(request.file_content, conversion_timeout)
+            conversion_success = True
+            log_print("INFO: Gotenberg conversion successful")
+            
+            # Save PDF content to file
+            with open(path_pdf, "wb") as f:
+                f.write(pdf_content)
+                
+        except Exception as e:
+            log_print(f"WARNING: Gotenberg conversion failed: {e}, will try fallback", "WARNING")
     else:
-        log_print("WARNING: LibreOffice not available, skipping to fallback", "WARNING")
+        log_print("INFO: Gotenberg disabled, trying LibreOffice...")
+        # Fallback to old LibreOffice method if Gotenberg disabled
+        if engines["libreoffice"]:
+            loop = asyncio.get_event_loop()
+            lo_success = await loop.run_in_executor(None, convert_with_libreoffice, path_docx, path_pdf, conversion_timeout)
+            conversion_success = lo_success
+            
+            if lo_success:
+                log_print("INFO: LibreOffice conversion successful")
+            else:
+                log_print("WARNING: LibreOffice conversion failed, will try fallback", "WARNING")
 
-    # Try MS Word fallback if LibreOffice failed and MS Word is available
+    # Try MS Word fallback if primary conversion failed and MS Word is available
     if not conversion_success and engines["ms_word"]:
         log_print("INFO: Trying fallback via MS Word/Automator (docx2pdf)...")
         try:
-            conversion_success = await loop.run_in_executor(
-                None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
-            )
-            fallback_used = True
+            # Use semaphore to limit concurrent MS Word processes
+            async with MS_WORD_SEMAPHORE:
+                loop = asyncio.get_event_loop()
+                conversion_success = await loop.run_in_executor(
+                    None, convert_with_timeout, path_docx, path_pdf, conversion_timeout
+                )
+                fallback_used = True
+                
             if conversion_success:
                 log_print("INFO: MS Word fallback conversion successful")
             else:
@@ -805,10 +874,12 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
             pass
         # Provide more specific error messages based on what was tried
         error_parts = []
-        if engines["libreoffice"]:
+        if USE_GOTENBERG:
+            error_parts.append("Gotenberg conversion failed")
+        elif engines["libreoffice"]:
             error_parts.append("LibreOffice conversion failed")
         else:
-            error_parts.append("LibreOffice not available")
+            error_parts.append("Primary conversion engine not available")
             
         if engines["ms_word"]:
             if fallback_used:
@@ -820,7 +891,7 @@ async def process_single_conversion(request: ConversionRequest) -> Dict[str, Any
             
         error_msg = f"Conversion failed: {', '.join(error_parts)}. "
         
-        if not any(engines.values()):
+        if not USE_GOTENBERG and not any(engines.values()):
             error_msg += "No conversion engines are available. Please install LibreOffice or MS Word."
         else:
             error_msg += "Please check if the DOCX file is valid and not corrupted."
